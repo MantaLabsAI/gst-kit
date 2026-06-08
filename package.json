@@ -23,7 +23,8 @@
     "postinstall": "node scripts/ensure-native-addon.mjs",
     "lint": "oxlint",
     "lint:fix": "oxlint --fix",
-    "format": "prettier --write \"**/*.{ts,js,json,md}\""
+    "format": "prettier --write \"**/*.{ts,js,json,md}\"",
+    "prepare": "npm run build:ts"
   },
   "keywords": [
     "gstreamer",
