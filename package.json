@@ -1,6 +1,6 @@
 {
-  "name": "gst-kit",
-  "version": "0.2.7",
+  "name": "@mantalabs/gst-kit",
+  "version": "0.2.8-alpha1",
   "type": "module",
   "exports": {
     ".": {
