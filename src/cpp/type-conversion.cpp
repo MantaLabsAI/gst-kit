@@ -410,6 +410,28 @@ namespace TypeConversion {
       // Add flags from buffer
       GstBufferFlags flags = gst_buffer_get_flags(buf);
       result.Set("flags", Napi::Number::New(env, static_cast<uint32_t>(flags)));
+
+      // Add timing and offset information from buffer (pts/dts/duration in nanoseconds).
+      // Each field is omitted when the buffer holds no valid value for it.
+      if (GST_BUFFER_PTS_IS_VALID(buf)) {
+        result.Set("pts", Napi::Number::New(env, static_cast<double>(GST_BUFFER_PTS(buf))));
+      }
+      if (GST_BUFFER_DTS_IS_VALID(buf)) {
+        result.Set("dts", Napi::Number::New(env, static_cast<double>(GST_BUFFER_DTS(buf))));
+      }
+      if (GST_BUFFER_DURATION_IS_VALID(buf)) {
+        result.Set(
+          "duration", Napi::Number::New(env, static_cast<double>(GST_BUFFER_DURATION(buf)))
+        );
+      }
+      if (GST_BUFFER_OFFSET_IS_VALID(buf)) {
+        result.Set("offset", Napi::Number::New(env, static_cast<double>(GST_BUFFER_OFFSET(buf))));
+      }
+      if (GST_BUFFER_OFFSET_END_IS_VALID(buf)) {
+        result.Set(
+          "offsetEnd", Napi::Number::New(env, static_cast<double>(GST_BUFFER_OFFSET_END(buf)))
+        );
+      }
     }
 
     // Add caps from sample
