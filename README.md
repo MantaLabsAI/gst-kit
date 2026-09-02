@@ -810,6 +810,49 @@ setTimeout(async () => {
 }, 5000);
 ```
 
+### Releasing a Pipeline (dispose)
+
+Call `dispose()` when you are permanently done with a pipeline to free its native
+memory right away, instead of waiting for the garbage collector to finalize the
+wrapper.
+
+Why it matters: the native `GstPipeline` allocation (buffers, decoders, GStreamer
+internals) lives outside V8's heap and is invisible to its GC accounting. A
+pipeline you simply drop is only reclaimed when GC happens to collect the small JS
+wrapper — and with a flat JS heap, V8 feels little pressure to do so. A long
+running process that builds a pipeline per recording or transcode can watch RSS
+climb steadily while the JS heap stays flat. `dispose()` drives the pipeline to
+the NULL state and drops the native reference synchronously, so the memory is
+returned immediately.
+
+```javascript
+import { Pipeline } from "gst-kit";
+
+const pipeline = new Pipeline("videotestsrc ! theoraenc ! oggmux ! filesink location=out.ogv");
+await pipeline.play();
+
+// ... record, then finish cleanly ...
+pipeline.endOfStream();
+while (true) {
+  const msg = await pipeline.busPop(1000);
+  if (msg?.type === "eos") break;
+}
+await pipeline.stop();
+
+// Release the native pipeline now rather than at some later GC.
+pipeline.dispose();
+
+// dispose() is terminal and idempotent. Any method call afterward throws
+// "Pipeline used after dispose()", and a second dispose() is a harmless no-op.
+```
+
+**Key points:**
+
+- **Terminal**: call it once, after `stop()`, when the pipeline will not be used again.
+- **Not a graceful stop**: `dispose()` does the hard release. For a clean flush, do `endOfStream()` + wait for EOS and/or `stop()` first.
+- **Idempotent**: calling `dispose()` again does nothing.
+- **Use-after-dispose is loud**: subsequent method calls throw rather than touching freed memory.
+
 ### Message Bus Handling
 
 ```javascript
@@ -916,6 +959,9 @@ class Pipeline {
 
   // Message handling
   busPop(timeoutMs?: number): Promise<GstMessage | null>;
+
+  // Lifecycle — release the native pipeline and free its memory immediately
+  dispose(): void;
 }
 ```
 
@@ -1072,6 +1118,7 @@ gst-kit/
 │   ├── appsrc.mjs            # AppSrc usage
 │   ├── appsrc-eos.mjs        # AppSrc with end-of-stream
 │   ├── pipeline-eos.mjs      # Pipeline-level end-of-stream
+│   ├── dispose.mjs           # Releasing a pipeline's native memory
 │   ├── record-to-file.mjs    # Recording to file example
 │   ├── rtp-timestamp.mjs     # RTP handling
 │   ├── bus.mjs               # Message bus handling

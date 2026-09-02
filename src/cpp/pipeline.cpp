@@ -89,6 +89,11 @@ Pipeline::Pipeline(const Napi::CallbackInfo &info) :
     [this](const Napi::CallbackInfo &info) -> Napi::Value { return this->end_of_stream(info); },
     "endOfStream"
   );
+  auto dispose_method = Napi::Function::New(
+    env,
+    [this](const Napi::CallbackInfo &info) -> Napi::Value { return this->dispose(info); },
+    "dispose"
+  );
 
   thisObj.DefineProperties(
     {Napi::PropertyDescriptor::Value("play", play_method, napi_enumerable),
@@ -102,8 +107,17 @@ Pipeline::Pipeline(const Napi::CallbackInfo &info) :
      Napi::PropertyDescriptor::Value("queryDuration", queryDuration_method, napi_enumerable),
      Napi::PropertyDescriptor::Value("busPop", busPop_method, napi_enumerable),
      Napi::PropertyDescriptor::Value("seek", seek_method, napi_enumerable),
-     Napi::PropertyDescriptor::Value("endOfStream", end_of_stream_method, napi_enumerable)}
+     Napi::PropertyDescriptor::Value("endOfStream", end_of_stream_method, napi_enumerable),
+     Napi::PropertyDescriptor::Value("dispose", dispose_method, napi_enumerable)}
   );
+}
+
+GstPipeline *Pipeline::require_pipeline(const Napi::Env &env) {
+  GstPipeline *raw = pipeline.get();
+  if (raw == nullptr) {
+    Napi::Error::New(env, "Pipeline used after dispose()").ThrowAsJavaScriptException();
+  }
+  return raw;
 }
 
 Napi::Value Pipeline::play(const Napi::CallbackInfo &info) {
@@ -123,9 +137,11 @@ Napi::Value Pipeline::play(const Napi::CallbackInfo &info) {
     }
   }
 
+  GstPipeline *raw = require_pipeline(env);
+  if (raw == nullptr) return env.Undefined();
+
   // Create worker and get its promise
-  StateChangeWorker *worker =
-    new StateChangeWorker(env, pipeline.get(), GST_STATE_PLAYING, timeout);
+  StateChangeWorker *worker = new StateChangeWorker(env, raw, GST_STATE_PLAYING, timeout);
   Napi::Promise promise = worker->GetPromise().Promise();
   worker->Queue();
 
@@ -149,8 +165,11 @@ Napi::Value Pipeline::pause(const Napi::CallbackInfo &info) {
     }
   }
 
+  GstPipeline *raw = require_pipeline(env);
+  if (raw == nullptr) return env.Undefined();
+
   // Create worker and get its promise
-  StateChangeWorker *worker = new StateChangeWorker(env, pipeline.get(), GST_STATE_PAUSED, timeout);
+  StateChangeWorker *worker = new StateChangeWorker(env, raw, GST_STATE_PAUSED, timeout);
   Napi::Promise promise = worker->GetPromise().Promise();
   worker->Queue();
 
@@ -174,8 +193,11 @@ Napi::Value Pipeline::stop(const Napi::CallbackInfo &info) {
     }
   }
 
+  GstPipeline *raw = require_pipeline(env);
+  if (raw == nullptr) return env.Undefined();
+
   // Create worker and get its promise
-  StateChangeWorker *worker = new StateChangeWorker(env, pipeline.get(), GST_STATE_NULL, timeout);
+  StateChangeWorker *worker = new StateChangeWorker(env, raw, GST_STATE_NULL, timeout);
   Napi::Promise promise = worker->GetPromise().Promise();
   worker->Queue();
 
@@ -183,40 +205,56 @@ Napi::Value Pipeline::stop(const Napi::CallbackInfo &info) {
 }
 
 Napi::Value Pipeline::get_element_by_name(const Napi::CallbackInfo &info) {
-  auto name = info[0].As<Napi::String>().Utf8Value();
-  GstElement *e = gst_bin_get_by_name(GST_BIN(pipeline.get()), name.c_str());
+  Napi::Env env = info.Env();
+  GstPipeline *raw = require_pipeline(env);
+  if (raw == nullptr) return env.Undefined();
 
-  if (e == nullptr) return info.Env().Null();
+  auto name = info[0].As<Napi::String>().Utf8Value();
+  GstElement *e = gst_bin_get_by_name(GST_BIN(raw), name.c_str());
+
+  if (e == nullptr) return env.Null();
 
   // Use the stored constructors to create the appropriate element
-  return Element::CreateFromGstElement(info.Env(), e);
+  return Element::CreateFromGstElement(env, e);
 }
 
 Napi::Value Pipeline::playing(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  GstPipeline *raw = require_pipeline(env);
+  if (raw == nullptr) return env.Undefined();
+
   GstState state;
   GstState pending;
   GstStateChangeReturn ret =
-    gst_element_get_state(GST_ELEMENT(pipeline.get()), &state, &pending, 5 * GST_MSECOND);
+    gst_element_get_state(GST_ELEMENT(raw), &state, &pending, 5 * GST_MSECOND);
 
   // If state change is in progress and we're transitioning to PLAYING, consider it as playing
   bool is_playing =
     (state == GST_STATE_PLAYING) || (ret == GST_STATE_CHANGE_ASYNC && pending == GST_STATE_PLAYING);
 
-  return Napi::Boolean::New(info.Env(), is_playing);
+  return Napi::Boolean::New(env, is_playing);
 }
 
 Napi::Value Pipeline::query_position(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  GstPipeline *raw = require_pipeline(env);
+  if (raw == nullptr) return env.Undefined();
+
   gint64 pos;
-  gst_element_query_position(GST_ELEMENT(pipeline.get()), GST_FORMAT_TIME, &pos);
+  gst_element_query_position(GST_ELEMENT(raw), GST_FORMAT_TIME, &pos);
   double r = pos == -1 ? -1 : (double)pos / GST_SECOND;
-  return Napi::Number::New(info.Env(), r);
+  return Napi::Number::New(env, r);
 }
 
 Napi::Value Pipeline::query_duration(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  GstPipeline *raw = require_pipeline(env);
+  if (raw == nullptr) return env.Undefined();
+
   gint64 dur;
-  gst_element_query_duration(GST_ELEMENT(pipeline.get()), GST_FORMAT_TIME, &dur);
+  gst_element_query_duration(GST_ELEMENT(raw), GST_FORMAT_TIME, &dur);
   double r = dur == -1 ? -1 : (double)dur / GST_SECOND;
-  return Napi::Number::New(info.Env(), r);
+  return Napi::Number::New(env, r);
 }
 
 Napi::Value Pipeline::bus_pop(const Napi::CallbackInfo &info) {
@@ -236,8 +274,11 @@ Napi::Value Pipeline::bus_pop(const Napi::CallbackInfo &info) {
     }
   }
 
+  GstPipeline *raw = require_pipeline(env);
+  if (raw == nullptr) return env.Undefined();
+
   // Create worker and get its promise
-  BusPopWorker *worker = new BusPopWorker(env, pipeline.get(), timeout);
+  BusPopWorker *worker = new BusPopWorker(env, raw, timeout);
   Napi::Promise promise = worker->GetPromise().Promise();
   worker->Queue();
 
@@ -260,12 +301,15 @@ Napi::Value Pipeline::seek(const Napi::CallbackInfo &info) {
     return env.Undefined();
   }
 
+  GstPipeline *raw = require_pipeline(env);
+  if (raw == nullptr) return env.Undefined();
+
   // Convert seconds to nanoseconds
   GstClockTime position_ns = static_cast<GstClockTime>(position_seconds * GST_SECOND);
 
   // Perform the seek
   gboolean result = gst_element_seek(
-    GST_ELEMENT(pipeline.get()),
+    GST_ELEMENT(raw),
     1.0,                 // Rate (1.0 = normal speed)
     GST_FORMAT_TIME,     // Format (time-based seeking)
     GST_SEEK_FLAG_FLUSH, // Flags (flush pipeline)
@@ -280,6 +324,8 @@ Napi::Value Pipeline::seek(const Napi::CallbackInfo &info) {
 
 Napi::Value Pipeline::end_of_stream(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
+  GstPipeline *raw = require_pipeline(env);
+  if (raw == nullptr) return env.Undefined();
 
   // Query pipeline state with a 5ms timeout
   // Note: Sending EOS to a PAUSED pipeline where sinks have not yet prerolled
@@ -287,7 +333,7 @@ Napi::Value Pipeline::end_of_stream(const Napi::CallbackInfo &info) {
   // which waits on the preroll condition. This is a GStreamer-level behavior.
   GstState state;
   GstState pending;
-  gst_element_get_state(GST_ELEMENT(pipeline.get()), &state, &pending, 5 * GST_MSECOND);
+  gst_element_get_state(GST_ELEMENT(raw), &state, &pending, 5 * GST_MSECOND);
 
   // Only send EOS if pipeline is in PLAYING or PAUSED state
   if (state != GST_STATE_PLAYING && state != GST_STATE_PAUSED) {
@@ -295,9 +341,26 @@ Napi::Value Pipeline::end_of_stream(const Napi::CallbackInfo &info) {
   }
 
   // Send EOS event to the pipeline
-  gboolean result = gst_element_send_event(GST_ELEMENT(pipeline.get()), gst_event_new_eos());
+  gboolean result = gst_element_send_event(GST_ELEMENT(raw), gst_event_new_eos());
 
   return Napi::Boolean::New(env, result);
+}
+
+Napi::Value Pipeline::dispose(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
+  // Idempotent: a null pipeline is the already-disposed state
+  GstPipeline *raw = pipeline.get();
+  if (raw == nullptr) return env.Undefined();
+
+  // Stop the pipeline synchronously, then drop our reference. In-flight async
+  // workers hold their own gst_object_ref (see async-workers.cpp), so releasing
+  // here is safe. unique_ptr's deleter (gst_object_unref) frees the native
+  // GstPipeline once the last reference goes away.
+  gst_element_set_state(GST_ELEMENT(raw), GST_STATE_NULL);
+  pipeline.reset();
+
+  return env.Undefined();
 }
 
 Napi::Value Pipeline::ElementExists(const Napi::CallbackInfo &info) {
