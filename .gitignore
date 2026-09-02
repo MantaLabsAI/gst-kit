@@ -3,7 +3,9 @@ node_modules/
 
 # Build outputs
 build/
-dist/
+# dist/ is committed so consumers installing this as a git dependency get the
+# JS entry points and type declarations without running the `prepare` build
+# (e.g. `pnpm install --ignore-scripts` in CI). Rebuild with `npm run build:ts`.
 *.node
 *.o
 *.obj
