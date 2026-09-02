@@ -19,6 +19,7 @@
     "test:unit:bun": "bun x vitest --no-watch --no-file-parallelism --sequence.concurrent=false",
     "test:unit:deno": "deno run -A --node-modules-dir=auto npm:vitest --no-watch --no-file-parallelism --sequence.concurrent=false",
     "test": "npm run test:unit",
+    "prepare": "npm run build:ts",
     "prepublishOnly": "npm run build:ts",
     "postinstall": "node scripts/ensure-native-addon.mjs",
     "lint": "oxlint",
