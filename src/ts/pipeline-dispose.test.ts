@@ -20,14 +20,15 @@ describe("Pipeline dispose()", () => {
     expect(() => pipeline.dispose()).not.toThrow();
   });
 
-  it("should dispose a pipeline directly after play, without an explicit stop", async () => {
+  it("should not throw when disposing a still-playing pipeline", async () => {
     const pipeline = new Pipeline("videotestsrc ! fakesink");
 
     await pipeline.play();
     expect(pipeline.playing()).toBe(true);
 
-    // dispose() drives the pipeline to NULL itself, so calling it on a still
-    // playing pipeline is safe and releases the native resources.
+    // Callers are expected to stop() first, but dispose() must not blow up if
+    // they don't: it drops the native reference without issuing a state change,
+    // and GStreamer tears the pipeline down when the last reference is released.
     expect(() => pipeline.dispose()).not.toThrow();
   });
 

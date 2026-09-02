@@ -350,14 +350,16 @@ Napi::Value Pipeline::dispose(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
 
   // Idempotent: a null pipeline is the already-disposed state
-  GstPipeline *raw = pipeline.get();
-  if (raw == nullptr) return env.Undefined();
+  if (pipeline.get() == nullptr) return env.Undefined();
 
-  // Stop the pipeline synchronously, then drop our reference. In-flight async
-  // workers hold their own gst_object_ref (see async-workers.cpp), so releasing
-  // here is safe. unique_ptr's deleter (gst_object_unref) frees the native
-  // GstPipeline once the last reference goes away.
-  gst_element_set_state(GST_ELEMENT(raw), GST_STATE_NULL);
+  // Drop our reference and let unique_ptr's deleter (gst_object_unref) run. This
+  // does not issue a state change: callers stop() first (see the TS contract),
+  // and re-issuing set_state(NULL) here would be a synchronous, potentially
+  // blocking transition on the JS thread — exactly what play/pause/stop offload
+  // to a StateChangeWorker to avoid. When the last reference goes away GStreamer
+  // tears the pipeline down to NULL itself. In-flight async workers each hold
+  // their own gst_object_ref (see async-workers.cpp), so releasing here cannot
+  // free the native pipeline out from under a running busPop()/state change.
   pipeline.reset();
 
   return env.Undefined();

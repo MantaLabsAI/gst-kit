@@ -848,8 +848,10 @@ pipeline.dispose();
 
 **Key points:**
 
-- **Terminal**: call it once, after `stop()`, when the pipeline will not be used again.
-- **Not a graceful stop**: `dispose()` does the hard release. For a clean flush, do `endOfStream()` + wait for EOS and/or `stop()` first.
+- **Stop first**: always `stop()` (or `endOfStream()` + wait for EOS, then `stop()`) before `dispose()`. `dispose()` only drops the native reference; it does not issue a state change, so it must not be the thing that stops a running pipeline.
+- **Terminal**: call it once, when the pipeline will not be used again.
+- **Not a graceful stop**: `dispose()` does the hard release, not a flush.
+- **Release elements first**: any element obtained via `getElementByName()`, and any pad-probe or `onSample()` subscription on it, must be released/unsubscribed before `dispose()`. Elements hold their own reference and are not invalidated by disposing the pipeline.
 - **Idempotent**: calling `dispose()` again does nothing.
 - **Use-after-dispose is loud**: subsequent method calls throw rather than touching freed memory.
 
