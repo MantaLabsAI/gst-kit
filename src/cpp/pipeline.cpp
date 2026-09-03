@@ -352,14 +352,33 @@ Napi::Value Pipeline::dispose(const Napi::CallbackInfo &info) {
   // Idempotent: a null pipeline is the already-disposed state
   if (pipeline.get() == nullptr) return env.Undefined();
 
-  // Drop our reference and let unique_ptr's deleter (gst_object_unref) run. This
-  // does not issue a state change: callers stop() first (see the TS contract),
-  // and re-issuing set_state(NULL) here would be a synchronous, potentially
-  // blocking transition on the JS thread — exactly what play/pause/stop offload
-  // to a StateChangeWorker to avoid. When the last reference goes away GStreamer
-  // tears the pipeline down to NULL itself. In-flight async workers each hold
-  // their own gst_object_ref (see async-workers.cpp), so releasing here cannot
-  // free the native pipeline out from under a running busPop()/state change.
+  // dispose() only drops the native reference; it does not issue a state change.
+  // A state change to NULL is a synchronous, potentially blocking transition on
+  // the JS thread — exactly what play/pause/stop offload to a StateChangeWorker
+  // to avoid. So dispose() requires the caller to have stopped the pipeline
+  // first (see the TS contract).
+  //
+  // Enforce that contract: GStreamer's gst_element_dispose refuses to tear down
+  // an element that is not in the NULL state — it emits a g_critical and returns
+  // without releasing pads, bus, clock and contexts, which leaks the native
+  // pipeline (and aborts under G_DEBUG=fatal-criticals). Rather than silently
+  // leak, fail loudly so the caller stops the pipeline before disposing.
+  GstState state;
+  GstState pending;
+  gst_element_get_state(GST_ELEMENT(pipeline.get()), &state, &pending, 0);
+  if (state != GST_STATE_NULL || pending != GST_STATE_VOID_PENDING) {
+    Napi::Error::New(
+      env, "dispose() requires a stopped pipeline: call stop() before dispose()"
+    )
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // Drop our reference and let unique_ptr's deleter (gst_object_unref) run. When
+  // the last reference goes away GStreamer finalizes the now-NULL pipeline.
+  // In-flight async workers each hold their own gst_object_ref (see
+  // async-workers.cpp), so releasing here cannot free the native pipeline out
+  // from under a running busPop()/state change.
   pipeline.reset();
 
   return env.Undefined();

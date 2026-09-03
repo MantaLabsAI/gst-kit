@@ -821,9 +821,10 @@ internals) lives outside V8's heap and is invisible to its GC accounting. A
 pipeline you simply drop is only reclaimed when GC happens to collect the small JS
 wrapper — and with a flat JS heap, V8 feels little pressure to do so. A long
 running process that builds a pipeline per recording or transcode can watch RSS
-climb steadily while the JS heap stays flat. `dispose()` drives the pipeline to
-the NULL state and drops the native reference synchronously, so the memory is
-returned immediately.
+climb steadily while the JS heap stays flat. `dispose()` closes that gap: it
+drops the native reference synchronously once the pipeline is stopped, so the
+memory is released as soon as the last reference goes away rather than at some
+later GC.
 
 ```javascript
 import { Pipeline } from "gst-kit";
@@ -848,7 +849,7 @@ pipeline.dispose();
 
 **Key points:**
 
-- **Stop first**: always `stop()` (or `endOfStream()` + wait for EOS, then `stop()`) before `dispose()`. `dispose()` only drops the native reference; it does not issue a state change, so it must not be the thing that stops a running pipeline.
+- **Stop first (required)**: always `stop()` (or `endOfStream()` + wait for EOS, then `stop()`) before `dispose()`. `dispose()` only drops the native reference; it does not issue a state change. GStreamer refuses to tear down a pipeline that is not in the NULL state, so `dispose()` throws (`dispose() requires a stopped pipeline`) if the pipeline is still playing or paused. A pipeline that never left NULL (constructed but never played) can be disposed directly.
 - **Terminal**: call it once, when the pipeline will not be used again.
 - **Not a graceful stop**: `dispose()` does the hard release, not a flush.
 - **Release elements first**: any element obtained via `getElementByName()`, and any pad-probe or `onSample()` subscription on it, must be released/unsubscribed before `dispose()`. Elements hold their own reference and are not invalidated by disposing the pipeline.
