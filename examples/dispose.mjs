@@ -9,8 +9,9 @@
  * pipeline you simply drop is not reclaimed until GC happens to collect the small
  * JS wrapper. A process that builds a pipeline per unit of work (recording,
  * transcode, feed) can see RSS climb steadily while the JS heap stays flat.
- * dispose() closes that gap: it drives the pipeline to NULL and drops the native
- * reference synchronously.
+ * dispose() closes that gap: after the pipeline is stopped, it drops the native
+ * reference synchronously so the memory is released without waiting for GC.
+ * dispose() does not stop the pipeline — call stop() first, or it throws.
  *
  * This example builds, plays, stops, and disposes many short-lived pipelines in a
  * loop — the exact pattern where relying on GC timing leaks native memory. Run

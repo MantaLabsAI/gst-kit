@@ -20,15 +20,36 @@ describe("Pipeline dispose()", () => {
     expect(() => pipeline.dispose()).not.toThrow();
   });
 
-  it("should not throw when disposing a still-playing pipeline", async () => {
+  it("should throw when disposing a still-playing pipeline", async () => {
     const pipeline = new Pipeline("videotestsrc ! fakesink");
 
     await pipeline.play();
     expect(pipeline.playing()).toBe(true);
 
-    // Callers are expected to stop() first, but dispose() must not blow up if
-    // they don't: it drops the native reference without issuing a state change,
-    // and GStreamer tears the pipeline down when the last reference is released.
+    // dispose() only drops the native reference; it does not issue a state
+    // change. GStreamer refuses to tear down a non-NULL element, so disposing a
+    // still-playing pipeline would leak. dispose() enforces the stop-first
+    // contract by throwing instead.
+    expect(() => pipeline.dispose()).toThrow(/stop\(\) before dispose\(\)/);
+
+    // The pipeline is still usable after the rejected dispose(); stop then
+    // dispose cleanly.
+    await pipeline.stop();
+    expect(() => pipeline.dispose()).not.toThrow();
+  });
+
+  it("should be safe to dispose after a worker started against the pipeline resolves", async () => {
+    const pipeline = new Pipeline("videotestsrc ! fakesink");
+
+    await pipeline.play();
+
+    // Start an async worker (busPop) that holds its own gst_object_ref while it
+    // runs. The pipeline is stopped and the worker awaited before dispose(), so
+    // the reference the worker held is already released.
+    const pending = pipeline.busPop(1000);
+    await pipeline.stop();
+    await pending;
+
     expect(() => pipeline.dispose()).not.toThrow();
   });
 
