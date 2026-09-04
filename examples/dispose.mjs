@@ -9,13 +9,16 @@
  * pipeline you simply drop is not reclaimed until GC happens to collect the small
  * JS wrapper. A process that builds a pipeline per unit of work (recording,
  * transcode, feed) can see RSS climb steadily while the JS heap stays flat.
- * dispose() closes that gap: after the pipeline is stopped, it drops the native
- * reference synchronously so the memory is released without waiting for GC.
- * dispose() does not stop the pipeline — call stop() first, or it throws.
+ * dispose() closes that gap: it drives the pipeline to NULL if it is not already
+ * there and drops the native reference synchronously, so the memory is released
+ * without waiting for GC. Stopping first is recommended so dispose() stays cheap
+ * and non-blocking, but dispose() will force the NULL transition itself if
+ * needed.
  *
  * This example builds, plays, stops, and disposes many short-lived pipelines in a
- * loop — the exact pattern where relying on GC timing leaks native memory. Run
- * with `node --expose-gc examples/dispose.mjs` to also see RSS reported.
+ * loop — the exact pattern where relying on GC timing leaks native memory. RSS is
+ * always reported; run with `node --expose-gc examples/dispose.mjs` to also force
+ * a GC at the end so the "after" figure excludes collectable JS wrappers.
  */
 import { Pipeline } from "../dist/esm/index.mjs";
 

@@ -25,10 +25,18 @@ public:
   Napi::Value end_of_stream(const Napi::CallbackInfo &info);
   Napi::Value dispose(const Napi::CallbackInfo &info);
 
+  void state_worker_started();
+  void state_worker_finished();
+
 private:
   std::string pipeline_string;
   std::unique_ptr<GstPipeline, decltype(&gst_object_unref)> pipeline;
+  bool disposed;
+  int in_flight_state_changes;
   static bool gst_initialized;
   static void ensure_gst_initialized();
+  static GstClockTime parse_timeout(const Napi::CallbackInfo &info);
   GstPipeline *require_pipeline(const Napi::Env &env);
+  Napi::Value queue_state_change(const Napi::CallbackInfo &info, GstState target_state);
+  void release_native_pipeline();
 };

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { Pipeline, type GstMessage } from ".";
+import { Pipeline } from ".";
+import { waitForEos } from "./test-utils";
 
 describe("AppSrc End-of-Stream", () => {
   it("should send EOS signal through endOfStream method", async () => {
@@ -28,21 +29,9 @@ describe("AppSrc End-of-Stream", () => {
       // Send end-of-stream
       source.endOfStream();
 
-      // Wait for EOS message on the bus
-      let eosReceived = false;
-      let attempts = 0;
-      const maxAttempts = 20; // Increased attempts
-
-      while (!eosReceived && attempts < maxAttempts) {
-        const message: GstMessage | null = await pipeline.busPop(1000); // Increased timeout
-        attempts++;
-
-        if (message?.type === "eos") {
-          eosReceived = true;
-          expect(message.type).toBe("eos");
-          break;
-        }
-      }
+      // Wait for EOS to reach the bus before stopping, so the source loop
+      // unwinds cleanly instead of racing the state teardown.
+      const eosReceived = await waitForEos(pipeline, { attempts: 20, timeoutMs: 1000 });
 
       await pipeline.stop();
 
@@ -91,6 +80,10 @@ describe("AppSrc End-of-Stream", () => {
         // It's acceptable for the second call to fail
         expect(error).toBeDefined();
       }
+
+      // Drain to EOS before stopping so the source streaming thread has finished
+      // its loop; stopping mid-loop races GStreamer's internal EOS handling.
+      await waitForEos(pipeline, { attempts: 20, timeoutMs: 1000 });
 
       await pipeline.stop();
     }

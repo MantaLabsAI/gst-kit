@@ -52,6 +52,64 @@ describe("Pipeline dispose()", () => {
     expect(() => pipeline.dispose()).not.toThrow();
   });
 
+  it("should dispose safely while a state-change worker is still in flight", async () => {
+    const pipeline = new Pipeline("videotestsrc ! videoconvert ! queue ! fakesink");
+
+    // Start play() but do NOT await it: the StateChangeWorker is queued and will
+    // run on a background thread after dispose() returns. dispose() must defer
+    // its native teardown until that worker finishes, otherwise the worker
+    // drives the state back up and finalizes a non-NULL pipeline (a leak).
+    const playing = pipeline.play();
+
+    // dispose() while the worker is in flight — marks disposed immediately and
+    // defers the release.
+    expect(() => pipeline.dispose()).not.toThrow();
+
+    // The pipeline is observably disposed right away.
+    expect(() => pipeline.playing()).toThrow(/used after dispose/);
+
+    // Awaiting the in-flight worker completes without error; the deferred
+    // teardown runs when it finishes.
+    await expect(playing).resolves.toBeDefined();
+
+    // Still disposed, and a second dispose() is a no-op.
+    expect(() => pipeline.dispose()).not.toThrow();
+  });
+
+  it("should not grow RSS when disposing with a state change in flight repeatedly", async () => {
+    // Guards finding 1: a queued state-change worker must not finalize a
+    // non-NULL pipeline after dispose(). Without the deferred teardown this loop
+    // leaks several MB per iteration; with it, RSS stays essentially flat.
+    const iterations = 100;
+
+    const build = () => new Pipeline("videotestsrc ! videoconvert ! queue ! fakesink");
+
+    // Warm up so first-touch allocations don't skew the baseline.
+    for (let i = 0; i < 10; i++) {
+      const p = build();
+      const playing = p.play();
+      p.dispose();
+      await playing;
+    }
+    if (typeof globalThis.gc === "function") globalThis.gc();
+    const before = process.memoryUsage().rss;
+
+    for (let i = 0; i < iterations; i++) {
+      const p = build();
+      const playing = p.play(); // in flight
+      p.dispose(); // deferred teardown
+      await playing; // teardown runs here
+    }
+
+    if (typeof globalThis.gc === "function") globalThis.gc();
+    const after = process.memoryUsage().rss;
+
+    const growthMb = (after - before) / 1024 / 1024;
+    // A per-iteration leak of the ~3 MB pipeline would be hundreds of MB over
+    // 100 iterations. Allow generous headroom for allocator/GC noise.
+    expect(growthMb).toBeLessThan(50);
+  });
+
   it("should be idempotent — a second dispose() is a no-op", async () => {
     const pipeline = new Pipeline("videotestsrc ! fakesink");
 

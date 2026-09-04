@@ -23,7 +23,8 @@ Napi::Object Pipeline::Init(const Napi::Env &env, const Napi::Object &exports) {
 }
 
 Pipeline::Pipeline(const Napi::CallbackInfo &info) :
-    Napi::ObjectWrap<Pipeline>(info), pipeline(nullptr, gst_object_unref) {
+    Napi::ObjectWrap<Pipeline>(info), pipeline(nullptr, gst_object_unref), disposed(false),
+    in_flight_state_changes(0) {
   ensure_gst_initialized();
   Napi::Env env = info.Env();
   GError *err = NULL;
@@ -113,95 +114,114 @@ Pipeline::Pipeline(const Napi::CallbackInfo &info) :
 }
 
 GstPipeline *Pipeline::require_pipeline(const Napi::Env &env) {
-  GstPipeline *raw = pipeline.get();
-  if (raw == nullptr) {
+  // `disposed` is the authoritative sentinel, not a null `pipeline`: when
+  // dispose() runs while a state-change worker is in flight the native teardown
+  // is deferred, so the pointer can still be non-null after dispose() returns.
+  // Guarding on the flag keeps use-after-dispose loud in that window too.
+  if (disposed || pipeline.get() == nullptr) {
     Napi::Error::New(env, "Pipeline used after dispose()").ThrowAsJavaScriptException();
+    return nullptr;
   }
-  return raw;
+  return pipeline.get();
+}
+
+void Pipeline::release_native_pipeline() {
+  GstPipeline *raw = pipeline.get();
+  if (raw == nullptr) return;
+
+  // The native pipeline must reach NULL before its reference is dropped:
+  // gst_object_unref on a non-NULL pipeline leaks its pads, bus, clock, and the
+  // elements' internal buffers (and can emit a g_critical). Callers stop()
+  // first, so this is normally already NULL. But stop() is bounded by a timeout
+  // and its NULL transition may not have fully settled — so rather than skip the
+  // unref (which guarantees the leak we are trying to prevent), force the
+  // pipeline to NULL here, synchronously, and then release. Setting an
+  // already-NULL pipeline to NULL is a cheap no-op, so the common stopped-first
+  // path pays almost nothing; the blocking transition only happens on the rare
+  // not-fully-stopped path, where it is exactly what prevents the leak.
+  GstState state;
+  GstState pending;
+  gst_element_get_state(GST_ELEMENT(raw), &state, &pending, 0);
+  if (state != GST_STATE_NULL || pending != GST_STATE_VOID_PENDING) {
+    gst_element_set_state(GST_ELEMENT(raw), GST_STATE_NULL);
+    // Block until the NULL transition completes so the unref below finalizes a
+    // truly-NULL pipeline. NULL is reached synchronously for virtually all
+    // pipelines; the wait is bounded so a pathological element cannot hang here.
+    gst_element_get_state(GST_ELEMENT(raw), &state, &pending, 5 * GST_SECOND);
+  }
+
+  // Drop our reference and let unique_ptr's deleter (gst_object_unref) run.
+  pipeline.reset();
+}
+
+void Pipeline::state_worker_started() {
+  // Keep the JS wrapper alive for as long as a worker holds a back-pointer to
+  // this Pipeline, so the worker's OnOK/OnError can safely call back into it
+  // even if all JS references are dropped while the state change is in flight.
+  if (in_flight_state_changes == 0) Ref();
+  in_flight_state_changes++;
+}
+
+void Pipeline::state_worker_finished() {
+  if (in_flight_state_changes > 0) in_flight_state_changes--;
+
+  // If dispose() was requested while workers were running, the last worker to
+  // finish performs the deferred native teardown. By now no state change can
+  // drive the pipeline back up, so forcing NULL and releasing is safe.
+  if (disposed && in_flight_state_changes == 0) {
+    release_native_pipeline();
+  }
+
+  // Balance the Ref() taken in state_worker_started() once the last worker is
+  // done. This may finalize the wrapper, so touch no members afterward.
+  if (in_flight_state_changes == 0) Unref();
+}
+
+GstClockTime Pipeline::parse_timeout(const Napi::CallbackInfo &info) {
+  // Default timeout is 1000ms (1 second)
+  GstClockTime timeout = 1000 * GST_MSECOND;
+
+  // Check if timeout parameter is provided
+  if (info.Length() > 0 && info[0].IsNumber()) {
+    double timeout_ms = info[0].As<Napi::Number>().DoubleValue();
+    if (timeout_ms < 0) {
+      // Negative timeout means infinite wait
+      timeout = GST_CLOCK_TIME_NONE;
+    } else {
+      timeout = static_cast<GstClockTime>(timeout_ms * GST_MSECOND);
+    }
+  }
+
+  return timeout;
+}
+
+Napi::Value Pipeline::queue_state_change(const Napi::CallbackInfo &info, GstState target_state) {
+  Napi::Env env = info.Env();
+
+  GstClockTime timeout = parse_timeout(info);
+
+  GstPipeline *raw = require_pipeline(env);
+  if (raw == nullptr) return env.Undefined();
+
+  // Create worker and get its promise
+  StateChangeWorker *worker = new StateChangeWorker(env, this, raw, target_state, timeout);
+  Napi::Promise promise = worker->GetPromise().Promise();
+  state_worker_started();
+  worker->Queue();
+
+  return promise;
 }
 
 Napi::Value Pipeline::play(const Napi::CallbackInfo &info) {
-  Napi::Env env = info.Env();
-
-  // Default timeout is 1000ms (1 second)
-  GstClockTime timeout = 1000 * GST_MSECOND;
-
-  // Check if timeout parameter is provided
-  if (info.Length() > 0 && info[0].IsNumber()) {
-    double timeout_ms = info[0].As<Napi::Number>().DoubleValue();
-    if (timeout_ms < 0) {
-      // Negative timeout means infinite wait
-      timeout = GST_CLOCK_TIME_NONE;
-    } else {
-      timeout = static_cast<GstClockTime>(timeout_ms * GST_MSECOND);
-    }
-  }
-
-  GstPipeline *raw = require_pipeline(env);
-  if (raw == nullptr) return env.Undefined();
-
-  // Create worker and get its promise
-  StateChangeWorker *worker = new StateChangeWorker(env, raw, GST_STATE_PLAYING, timeout);
-  Napi::Promise promise = worker->GetPromise().Promise();
-  worker->Queue();
-
-  return promise;
+  return queue_state_change(info, GST_STATE_PLAYING);
 }
 
 Napi::Value Pipeline::pause(const Napi::CallbackInfo &info) {
-  Napi::Env env = info.Env();
-
-  // Default timeout is 1000ms (1 second)
-  GstClockTime timeout = 1000 * GST_MSECOND;
-
-  // Check if timeout parameter is provided
-  if (info.Length() > 0 && info[0].IsNumber()) {
-    double timeout_ms = info[0].As<Napi::Number>().DoubleValue();
-    if (timeout_ms < 0) {
-      // Negative timeout means infinite wait
-      timeout = GST_CLOCK_TIME_NONE;
-    } else {
-      timeout = static_cast<GstClockTime>(timeout_ms * GST_MSECOND);
-    }
-  }
-
-  GstPipeline *raw = require_pipeline(env);
-  if (raw == nullptr) return env.Undefined();
-
-  // Create worker and get its promise
-  StateChangeWorker *worker = new StateChangeWorker(env, raw, GST_STATE_PAUSED, timeout);
-  Napi::Promise promise = worker->GetPromise().Promise();
-  worker->Queue();
-
-  return promise;
+  return queue_state_change(info, GST_STATE_PAUSED);
 }
 
 Napi::Value Pipeline::stop(const Napi::CallbackInfo &info) {
-  Napi::Env env = info.Env();
-
-  // Default timeout is 1000ms (1 second)
-  GstClockTime timeout = 1000 * GST_MSECOND;
-
-  // Check if timeout parameter is provided
-  if (info.Length() > 0 && info[0].IsNumber()) {
-    double timeout_ms = info[0].As<Napi::Number>().DoubleValue();
-    if (timeout_ms < 0) {
-      // Negative timeout means infinite wait
-      timeout = GST_CLOCK_TIME_NONE;
-    } else {
-      timeout = static_cast<GstClockTime>(timeout_ms * GST_MSECOND);
-    }
-  }
-
-  GstPipeline *raw = require_pipeline(env);
-  if (raw == nullptr) return env.Undefined();
-
-  // Create worker and get its promise
-  StateChangeWorker *worker = new StateChangeWorker(env, raw, GST_STATE_NULL, timeout);
-  Napi::Promise promise = worker->GetPromise().Promise();
-  worker->Queue();
-
-  return promise;
+  return queue_state_change(info, GST_STATE_NULL);
 }
 
 Napi::Value Pipeline::get_element_by_name(const Napi::CallbackInfo &info) {
@@ -260,19 +280,7 @@ Napi::Value Pipeline::query_duration(const Napi::CallbackInfo &info) {
 Napi::Value Pipeline::bus_pop(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
 
-  // Default timeout is 1000ms (1 second) - converted to nanoseconds
-  GstClockTime timeout = 1000 * GST_MSECOND;
-
-  // Check if timeout parameter is provided
-  if (info.Length() > 0 && info[0].IsNumber()) {
-    double timeout_ms = info[0].As<Napi::Number>().DoubleValue();
-    if (timeout_ms < 0) {
-      // Negative timeout means infinite wait
-      timeout = GST_CLOCK_TIME_NONE;
-    } else {
-      timeout = static_cast<GstClockTime>(timeout_ms * GST_MSECOND);
-    }
-  }
+  GstClockTime timeout = parse_timeout(info);
 
   GstPipeline *raw = require_pipeline(env);
   if (raw == nullptr) return env.Undefined();
@@ -349,40 +357,25 @@ Napi::Value Pipeline::end_of_stream(const Napi::CallbackInfo &info) {
 Napi::Value Pipeline::dispose(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
 
-  // Idempotent: a null pipeline is the already-disposed state
-  if (pipeline.get() == nullptr) return env.Undefined();
+  // Idempotent: once disposed, further calls are no-ops.
+  if (disposed) return env.Undefined();
 
-  // dispose() only drops the native reference; it does not issue a state change.
-  // The native pipeline must reach NULL before its reference is dropped:
-  // gst_object_unref on a non-NULL pipeline leaks its pads, bus, clock, and the
-  // elements' internal buffers (and can emit a g_critical). Callers stop()
-  // first, so this is normally already NULL. But stop() is bounded by a timeout
-  // and its NULL transition may not have fully settled by the time dispose()
-  // runs — so rather than throw and skip the unref (which guarantees the leak we
-  // are trying to prevent), force the pipeline to NULL here, synchronously, and
-  // then release. Setting an already-NULL pipeline to NULL is a cheap no-op, so
-  // the common stopped-first path pays almost nothing; the blocking transition
-  // only happens on the rare not-fully-stopped path, where it is exactly what
-  // prevents the leak.
-  GstState state;
-  GstState pending;
-  gst_element_get_state(GST_ELEMENT(pipeline.get()), &state, &pending, 0);
-  if (state != GST_STATE_NULL || pending != GST_STATE_VOID_PENDING) {
-    gst_element_set_state(GST_ELEMENT(pipeline.get()), GST_STATE_NULL);
-    // Block until the NULL transition completes so the unref below finalizes a
-    // truly-NULL pipeline. NULL is reached synchronously for virtually all
-    // pipelines; the wait is bounded so a pathological element cannot hang here.
-    gst_element_get_state(
-      GST_ELEMENT(pipeline.get()), &state, &pending, 5 * GST_SECOND
-    );
-  }
+  // Mark disposed immediately so use-after-dispose is guarded and a second
+  // dispose() is a no-op, regardless of whether the native teardown runs now or
+  // is deferred below.
+  disposed = true;
 
-  // Drop our reference and let unique_ptr's deleter (gst_object_unref) run. When
-  // the last reference goes away GStreamer finalizes the now-NULL pipeline.
-  // In-flight async workers each hold their own gst_object_ref (see
-  // async-workers.cpp), so releasing here cannot free the native pipeline out
-  // from under a running busPop()/state change.
-  pipeline.reset();
+  // dispose() drives the pipeline to NULL and drops the native reference. It
+  // must not do that while a state-change worker (play/pause/stop) is still in
+  // flight: that worker holds its own reference and can drive the state back up
+  // after we force NULL, leaving it to finalize a non-NULL pipeline — which
+  // leaks exactly what dispose() exists to reclaim. So when a worker is in
+  // flight, defer the teardown; the last worker to finish runs it (see
+  // state_worker_finished()). In-flight busPop()/pull workers do not change
+  // state, so they do not need to gate the teardown.
+  if (in_flight_state_changes > 0) return env.Undefined();
+
+  release_native_pipeline();
 
   return env.Undefined();
 }
