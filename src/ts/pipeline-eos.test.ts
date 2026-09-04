@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Pipeline, type GstMessage } from ".";
+import { waitForEos } from "./test-utils";
 
 describe("Pipeline EOS - State-Gated Dispatch", () => {
   it("should return true when pipeline is in PLAYING state", async () => {
@@ -10,7 +11,9 @@ describe("Pipeline EOS - State-Gated Dispatch", () => {
     const result = pipeline.endOfStream();
     expect(result).toBe(true);
 
-    await new Promise(resolve => setTimeout(resolve, 30));
+    // Let EOS propagate to the bus before stopping so the source loop unwinds
+    // cleanly rather than racing the state teardown.
+    await waitForEos(pipeline);
 
     await pipeline.stop();
   });
@@ -80,7 +83,7 @@ describe("Pipeline EOS - State-Gated Dispatch", () => {
     expect(result2).toBe(true);
     expect(result3).toBe(true);
 
-    await new Promise(resolve => setTimeout(resolve, 30));
+    await waitForEos(pipeline);
 
     await pipeline.stop();
   });
@@ -93,7 +96,7 @@ describe("Pipeline EOS - State-Gated Dispatch", () => {
     const resultWhilePlaying = pipeline.endOfStream();
     expect(resultWhilePlaying).toBe(true);
 
-    await new Promise(resolve => setTimeout(resolve, 30));
+    await waitForEos(pipeline);
 
     await pipeline.stop();
 
