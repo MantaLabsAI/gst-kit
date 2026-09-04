@@ -177,7 +177,9 @@ void Pipeline::state_worker_finished() {
   if (in_flight_state_changes == 0) Unref();
 }
 
-GstClockTime Pipeline::parse_timeout(const Napi::CallbackInfo &info) {
+Napi::Value Pipeline::play(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+
   // Default timeout is 1000ms (1 second)
   GstClockTime timeout = 1000 * GST_MSECOND;
 
@@ -192,19 +194,11 @@ GstClockTime Pipeline::parse_timeout(const Napi::CallbackInfo &info) {
     }
   }
 
-  return timeout;
-}
-
-Napi::Value Pipeline::queue_state_change(const Napi::CallbackInfo &info, GstState target_state) {
-  Napi::Env env = info.Env();
-
-  GstClockTime timeout = parse_timeout(info);
-
   GstPipeline *raw = require_pipeline(env);
   if (raw == nullptr) return env.Undefined();
 
   // Create worker and get its promise
-  StateChangeWorker *worker = new StateChangeWorker(env, this, raw, target_state, timeout);
+  StateChangeWorker *worker = new StateChangeWorker(env, this, raw, GST_STATE_PLAYING, timeout);
   Napi::Promise promise = worker->GetPromise().Promise();
   state_worker_started();
   worker->Queue();
@@ -212,16 +206,62 @@ Napi::Value Pipeline::queue_state_change(const Napi::CallbackInfo &info, GstStat
   return promise;
 }
 
-Napi::Value Pipeline::play(const Napi::CallbackInfo &info) {
-  return queue_state_change(info, GST_STATE_PLAYING);
-}
-
 Napi::Value Pipeline::pause(const Napi::CallbackInfo &info) {
-  return queue_state_change(info, GST_STATE_PAUSED);
+  Napi::Env env = info.Env();
+
+  // Default timeout is 1000ms (1 second)
+  GstClockTime timeout = 1000 * GST_MSECOND;
+
+  // Check if timeout parameter is provided
+  if (info.Length() > 0 && info[0].IsNumber()) {
+    double timeout_ms = info[0].As<Napi::Number>().DoubleValue();
+    if (timeout_ms < 0) {
+      // Negative timeout means infinite wait
+      timeout = GST_CLOCK_TIME_NONE;
+    } else {
+      timeout = static_cast<GstClockTime>(timeout_ms * GST_MSECOND);
+    }
+  }
+
+  GstPipeline *raw = require_pipeline(env);
+  if (raw == nullptr) return env.Undefined();
+
+  // Create worker and get its promise
+  StateChangeWorker *worker = new StateChangeWorker(env, this, raw, GST_STATE_PAUSED, timeout);
+  Napi::Promise promise = worker->GetPromise().Promise();
+  state_worker_started();
+  worker->Queue();
+
+  return promise;
 }
 
 Napi::Value Pipeline::stop(const Napi::CallbackInfo &info) {
-  return queue_state_change(info, GST_STATE_NULL);
+  Napi::Env env = info.Env();
+
+  // Default timeout is 1000ms (1 second)
+  GstClockTime timeout = 1000 * GST_MSECOND;
+
+  // Check if timeout parameter is provided
+  if (info.Length() > 0 && info[0].IsNumber()) {
+    double timeout_ms = info[0].As<Napi::Number>().DoubleValue();
+    if (timeout_ms < 0) {
+      // Negative timeout means infinite wait
+      timeout = GST_CLOCK_TIME_NONE;
+    } else {
+      timeout = static_cast<GstClockTime>(timeout_ms * GST_MSECOND);
+    }
+  }
+
+  GstPipeline *raw = require_pipeline(env);
+  if (raw == nullptr) return env.Undefined();
+
+  // Create worker and get its promise
+  StateChangeWorker *worker = new StateChangeWorker(env, this, raw, GST_STATE_NULL, timeout);
+  Napi::Promise promise = worker->GetPromise().Promise();
+  state_worker_started();
+  worker->Queue();
+
+  return promise;
 }
 
 Napi::Value Pipeline::get_element_by_name(const Napi::CallbackInfo &info) {
@@ -232,10 +272,10 @@ Napi::Value Pipeline::get_element_by_name(const Napi::CallbackInfo &info) {
   auto name = info[0].As<Napi::String>().Utf8Value();
   GstElement *e = gst_bin_get_by_name(GST_BIN(raw), name.c_str());
 
-  if (e == nullptr) return env.Null();
+  if (e == nullptr) return info.Env().Null();
 
   // Use the stored constructors to create the appropriate element
-  return Element::CreateFromGstElement(env, e);
+  return Element::CreateFromGstElement(info.Env(), e);
 }
 
 Napi::Value Pipeline::playing(const Napi::CallbackInfo &info) {
@@ -252,7 +292,7 @@ Napi::Value Pipeline::playing(const Napi::CallbackInfo &info) {
   bool is_playing =
     (state == GST_STATE_PLAYING) || (ret == GST_STATE_CHANGE_ASYNC && pending == GST_STATE_PLAYING);
 
-  return Napi::Boolean::New(env, is_playing);
+  return Napi::Boolean::New(info.Env(), is_playing);
 }
 
 Napi::Value Pipeline::query_position(const Napi::CallbackInfo &info) {
@@ -263,7 +303,7 @@ Napi::Value Pipeline::query_position(const Napi::CallbackInfo &info) {
   gint64 pos;
   gst_element_query_position(GST_ELEMENT(raw), GST_FORMAT_TIME, &pos);
   double r = pos == -1 ? -1 : (double)pos / GST_SECOND;
-  return Napi::Number::New(env, r);
+  return Napi::Number::New(info.Env(), r);
 }
 
 Napi::Value Pipeline::query_duration(const Napi::CallbackInfo &info) {
@@ -274,13 +314,25 @@ Napi::Value Pipeline::query_duration(const Napi::CallbackInfo &info) {
   gint64 dur;
   gst_element_query_duration(GST_ELEMENT(raw), GST_FORMAT_TIME, &dur);
   double r = dur == -1 ? -1 : (double)dur / GST_SECOND;
-  return Napi::Number::New(env, r);
+  return Napi::Number::New(info.Env(), r);
 }
 
 Napi::Value Pipeline::bus_pop(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
 
-  GstClockTime timeout = parse_timeout(info);
+  // Default timeout is 1000ms (1 second) - converted to nanoseconds
+  GstClockTime timeout = 1000 * GST_MSECOND;
+
+  // Check if timeout parameter is provided
+  if (info.Length() > 0 && info[0].IsNumber()) {
+    double timeout_ms = info[0].As<Napi::Number>().DoubleValue();
+    if (timeout_ms < 0) {
+      // Negative timeout means infinite wait
+      timeout = GST_CLOCK_TIME_NONE;
+    } else {
+      timeout = static_cast<GstClockTime>(timeout_ms * GST_MSECOND);
+    }
+  }
 
   GstPipeline *raw = require_pipeline(env);
   if (raw == nullptr) return env.Undefined();
