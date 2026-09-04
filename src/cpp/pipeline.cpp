@@ -353,25 +353,28 @@ Napi::Value Pipeline::dispose(const Napi::CallbackInfo &info) {
   if (pipeline.get() == nullptr) return env.Undefined();
 
   // dispose() only drops the native reference; it does not issue a state change.
-  // A state change to NULL is a synchronous, potentially blocking transition on
-  // the JS thread — exactly what play/pause/stop offload to a StateChangeWorker
-  // to avoid. So dispose() requires the caller to have stopped the pipeline
-  // first (see the TS contract).
-  //
-  // Enforce that contract: GStreamer's gst_element_dispose refuses to tear down
-  // an element that is not in the NULL state — it emits a g_critical and returns
-  // without releasing pads, bus, clock and contexts, which leaks the native
-  // pipeline (and aborts under G_DEBUG=fatal-criticals). Rather than silently
-  // leak, fail loudly so the caller stops the pipeline before disposing.
+  // The native pipeline must reach NULL before its reference is dropped:
+  // gst_object_unref on a non-NULL pipeline leaks its pads, bus, clock, and the
+  // elements' internal buffers (and can emit a g_critical). Callers stop()
+  // first, so this is normally already NULL. But stop() is bounded by a timeout
+  // and its NULL transition may not have fully settled by the time dispose()
+  // runs — so rather than throw and skip the unref (which guarantees the leak we
+  // are trying to prevent), force the pipeline to NULL here, synchronously, and
+  // then release. Setting an already-NULL pipeline to NULL is a cheap no-op, so
+  // the common stopped-first path pays almost nothing; the blocking transition
+  // only happens on the rare not-fully-stopped path, where it is exactly what
+  // prevents the leak.
   GstState state;
   GstState pending;
   gst_element_get_state(GST_ELEMENT(pipeline.get()), &state, &pending, 0);
   if (state != GST_STATE_NULL || pending != GST_STATE_VOID_PENDING) {
-    Napi::Error::New(
-      env, "dispose() requires a stopped pipeline: call stop() before dispose()"
-    )
-      .ThrowAsJavaScriptException();
-    return env.Undefined();
+    gst_element_set_state(GST_ELEMENT(pipeline.get()), GST_STATE_NULL);
+    // Block until the NULL transition completes so the unref below finalizes a
+    // truly-NULL pipeline. NULL is reached synchronously for virtually all
+    // pipelines; the wait is bounded so a pathological element cannot hang here.
+    gst_element_get_state(
+      GST_ELEMENT(pipeline.get()), &state, &pending, 5 * GST_SECOND
+    );
   }
 
   // Drop our reference and let unique_ptr's deleter (gst_object_unref) run. When

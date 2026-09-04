@@ -20,22 +20,21 @@ describe("Pipeline dispose()", () => {
     expect(() => pipeline.dispose()).not.toThrow();
   });
 
-  it("should throw when disposing a still-playing pipeline", async () => {
+  it("should dispose a still-playing pipeline by forcing it to NULL first", async () => {
     const pipeline = new Pipeline("videotestsrc ! fakesink");
 
     await pipeline.play();
     expect(pipeline.playing()).toBe(true);
 
-    // dispose() only drops the native reference; it does not issue a state
-    // change. GStreamer refuses to tear down a non-NULL element, so disposing a
-    // still-playing pipeline would leak. dispose() enforces the stop-first
-    // contract by throwing instead.
-    expect(() => pipeline.dispose()).toThrow(/stop\(\) before dispose\(\)/);
-
-    // The pipeline is still usable after the rejected dispose(); stop then
-    // dispose cleanly.
-    await pipeline.stop();
+    // Callers are expected to stop() first, but dispose() must not leak if they
+    // don't: rather than throw (which would skip the unref and leak the native
+    // pipeline), dispose() drives the pipeline to NULL synchronously and then
+    // releases it. So disposing a still-playing pipeline is safe and does not
+    // throw.
     expect(() => pipeline.dispose()).not.toThrow();
+
+    // After dispose() the pipeline is released; any further use throws.
+    expect(() => pipeline.playing()).toThrow(/used after dispose/);
   });
 
   it("should be safe to dispose after a worker started against the pipeline resolves", async () => {
