@@ -113,6 +113,12 @@ Pipeline::Pipeline(const Napi::CallbackInfo &info) :
   );
 }
 
+Pipeline::~Pipeline() {
+  // Safety net for a pipeline GC'd without an explicit dispose(). No-op if
+  // dispose() already ran.
+  release_native_pipeline();
+}
+
 GstPipeline *Pipeline::require_pipeline(const Napi::Env &env) {
   // `disposed` is the authoritative sentinel, not a null `pipeline`: when
   // dispose() runs while a state-change worker is in flight the native teardown
