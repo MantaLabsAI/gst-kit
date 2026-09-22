@@ -78,10 +78,33 @@ type BufferData = {
   };
   rtp?: RTPData;
 };
+type TimecodeValue = {
+  hours: number;
+  minutes: number;
+  seconds: number;
+  frames: number;
+  dropFrame?: boolean;
+};
+type Rational = {
+  numerator: number;
+  denominator: number;
+};
+type SetFirstFrameOptions = {
+  timecode: TimecodeValue;
+  rate?: Rational;
+  monotonicNs?: bigint;
+};
+type FirstFrameTimecodeResult = {
+  timecode: string;
+  pts?: number;
+  framerate: Rational;
+  dropFrame: boolean;
+};
 type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
   setElementProperty: (key: string, value: GStreamerPropertyValue) => void;
   addPadProbe: (padName: string, callback: (bufferData: BufferData) => void) => () => void;
+  setFirstFrameTimecode: (options: SetFirstFrameOptions) => Promise<FirstFrameTimecodeResult | null>;
   setPad: (attribute: string, padName: string) => void;
   getPad: (padName: string) => GstPad | null;
 };
@@ -158,4 +181,4 @@ declare const _default: {
   GStreamerPropertyReturnValue: GStreamerPropertyReturnValue;
 };
 //#endregion
-export { AppSinkElement, AppSrcElement, BufferData, ElementBase, GStreamerPropertyPrimitiveValue, GStreamerPropertyResult, GStreamerPropertyReturnValue, GStreamerPropertyValue, GStreamerSample, GstBufferFlags, GstMessage, GstPad, PipelineClass as Pipeline, RTPData, StateChangeResult, _default as default };
+export { AppSinkElement, AppSrcElement, BufferData, ElementBase, FirstFrameTimecodeResult, GStreamerPropertyPrimitiveValue, GStreamerPropertyResult, GStreamerPropertyReturnValue, GStreamerPropertyValue, GStreamerSample, GstBufferFlags, GstMessage, GstPad, PipelineClass as Pipeline, RTPData, Rational, SetFirstFrameOptions, StateChangeResult, TimecodeValue, _default as default };

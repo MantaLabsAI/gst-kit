@@ -120,10 +120,45 @@ export type BufferData = {
   rtp?: RTPData;
 };
 
+// First-frame timecode seeding types.
+export type TimecodeValue = {
+  hours: number;
+  minutes: number;
+  seconds: number;
+  frames: number;
+  dropFrame?: boolean;
+};
+
+export type Rational = { numerator: number; denominator: number };
+
+export type SetFirstFrameOptions = {
+  // The label to stamp on the first recorded frame (already computed by the caller).
+  timecode: TimecodeValue;
+  // Output/negotiated frame rate. If omitted, read from negotiated caps.
+  rate?: Rational;
+  // Monotonic instant of the reference snapshot, same domain as the pipeline
+  // clock. Reserved for a caller-side clock bridge; unused by the seed itself.
+  monotonicNs?: bigint;
+};
+
+// The applied label, read back from the stamper on the first buffer. Reflects the
+// value actually stamped, at the negotiated rate.
+export type FirstFrameTimecodeResult = {
+  timecode: string; // "HH:MM:SS:FF" / "HH:MM:SS;FF"
+  pts?: number; // first-frame PTS (ns)
+  framerate: Rational;
+  dropFrame: boolean;
+};
+
 export type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
   setElementProperty: (key: string, value: GStreamerPropertyValue) => void;
   addPadProbe: (padName: string, callback: (bufferData: BufferData) => void) => () => void;
+  // Arms the seed synchronously (before play) and resolves once the first buffer
+  // is stamped, with the label the stamper actually applied. Resolves null if the
+  // stream ends (EOS) or flushes before any buffer arrives — e.g. an aborted
+  // start. Call this before play() and await the returned Promise later.
+  setFirstFrameTimecode: (options: SetFirstFrameOptions) => Promise<FirstFrameTimecodeResult | null>;
   setPad: (attribute: string, padName: string) => void;
   getPad: (padName: string) => GstPad | null;
 };

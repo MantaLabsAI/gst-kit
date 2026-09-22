@@ -17,6 +17,7 @@ public:
   Napi::Value get_element_property(const Napi::CallbackInfo &info);
   Napi::Value set_element_property(const Napi::CallbackInfo &info);
   Napi::Value add_pad_probe(const Napi::CallbackInfo &info);
+  Napi::Value set_first_frame_timecode(const Napi::CallbackInfo &info);
   Napi::Value set_pad(const Napi::CallbackInfo &info);
   Napi::Value get_pad(const Napi::CallbackInfo &info);
 

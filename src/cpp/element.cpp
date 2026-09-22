@@ -4,7 +4,9 @@
 #include <chrono>
 #include <cstring>
 #include <gst/rtp/gstrtpbuffer.h>
+#include <gst/video/video.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -58,6 +60,13 @@ Element::Element(const Napi::CallbackInfo &info) :
     [this](const Napi::CallbackInfo &info) -> Napi::Value { return this->add_pad_probe(info); },
     "addPadProbe"
   );
+  auto set_first_frame_timecode_method = Napi::Function::New(
+    env,
+    [this](const Napi::CallbackInfo &info) -> Napi::Value {
+      return this->set_first_frame_timecode(info);
+    },
+    "setFirstFrameTimecode"
+  );
   auto set_pad_method = Napi::Function::New(
     env, [this](const Napi::CallbackInfo &info) -> Napi::Value { return this->set_pad(info); },
     "setPad"
@@ -84,6 +93,9 @@ Element::Element(const Napi::CallbackInfo &info) :
       "setElementProperty", set_element_property_method, napi_enumerable
     ),
     Napi::PropertyDescriptor::Value("addPadProbe", add_pad_probe_method, napi_enumerable),
+    Napi::PropertyDescriptor::Value(
+      "setFirstFrameTimecode", set_first_frame_timecode_method, napi_enumerable
+    ),
     Napi::PropertyDescriptor::Value("setPad", set_pad_method, napi_enumerable),
     Napi::PropertyDescriptor::Value("getPad", get_pad_method, napi_enumerable)
   };
@@ -480,6 +492,236 @@ Napi::Value Element::add_pad_probe(const Napi::CallbackInfo &info) {
 
     return info.Env().Undefined();
   });
+}
+
+// Synchronous first-frame timecode seed.
+// Seeds timecodestamper's set-internal-timecode from a sink-pad buffer probe on
+// the first buffer, on the streaming thread, before the stamper's transform_ip —
+// so frame 0 carries the label. The seed write is fully synchronous inside the
+// probe (no non-blocking call, buffer map/copy, JS call, or I/O before it); only
+// the result is delivered back to JS asynchronously via a Promise, resolved from
+// a thread-safe function. The probe self-removes after one seed. If the pad is
+// removed before any buffer (pipeline dispose / no signal), the result resolves
+// to null rather than leaving the Promise pending forever.
+struct SetFirstFrameContext {
+  std::mutex mutex;
+  GstElement *stamper = nullptr; // borrowed (owned by the Element/pipeline)
+  bool settled = false; // the Promise has been (or is being) resolved exactly once
+
+  // requested seed
+  guint fps_n = 0, fps_d = 1;
+  bool drop = false;
+  guint hh = 0, mm = 0, ss = 0, ff = 0;
+
+  // Resolves the Promise on the JS thread. Called at most once (settled guards).
+  // A null GstVideoTimeCode payload resolves the Promise with null (never fired).
+  Napi::ThreadSafeFunction tsfn;
+};
+
+// Result carried from the streaming thread to the JS resolver.
+struct SetFirstFrameResult {
+  bool ok = false; // false → resolve with null
+  std::string applied_tc;
+  guint64 first_pts = GST_CLOCK_TIME_NONE;
+  guint fps_n = 0, fps_d = 1;
+  bool drop = false;
+};
+
+// Resolve the Promise once, from the JS thread, then release the TSFN so its
+// resources (and the deferred) are freed. Safe to call from both the probe path
+// and the destroy path; `settled` makes it idempotent.
+static void set_first_frame_settle(SetFirstFrameContext *ctx, SetFirstFrameResult *result) {
+  {
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    if (ctx->settled) {
+      delete result;
+      return;
+    }
+    ctx->settled = true;
+  }
+  // Hop to the JS thread and invoke the resolver Function with the result
+  // wrapped as an External. The resolver resolves the deferred and deletes the
+  // result. NonBlockingCall may fail only if the TSFN is already closing, in
+  // which case free the result here to avoid a leak.
+  napi_status status =
+    ctx->tsfn.NonBlockingCall(result, [](Napi::Env env, Napi::Function jsCallback, SetFirstFrameResult *r) {
+      jsCallback.Call({Napi::External<SetFirstFrameResult>::New(env, r)});
+    });
+  if (status != napi_ok) {
+    delete result;
+  }
+  // Release lets the TSFN finalizer run once no calls are in flight.
+  ctx->tsfn.Release();
+}
+
+static GstPadProbeReturn
+set_first_frame_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+  SetFirstFrameContext *ctx = static_cast<SetFirstFrameContext *>(user_data);
+
+  // A downstream EOS or flush before any buffer means no frame will ever be
+  // stamped (num-buffers=0, abort, teardown). Settle the Promise with null and
+  // remove the probe so the caller never waits forever. This is the reliable
+  // teardown signal — GStreamer delivers it on the streaming/serialized path,
+  // unlike the probe destroy notify, which does not fire deterministically on
+  // dispose from NULL/READY.
+  if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) {
+    GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
+    if (event && (GST_EVENT_TYPE(event) == GST_EVENT_EOS ||
+                  GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_STOP)) {
+      set_first_frame_settle(ctx, new SetFirstFrameResult()); // ok=false → null
+      return GST_PAD_PROBE_REMOVE;
+    }
+    return GST_PAD_PROBE_OK;
+  }
+
+  if (!(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER))
+    return GST_PAD_PROBE_OK;
+
+  GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+
+  // Prefer the negotiated caps rate/DF over the requested one so the applied
+  // label agrees with what the stamper will count at; fall back to requested.
+  guint use_fps_n = ctx->fps_n, use_fps_d = ctx->fps_d;
+  bool use_drop = ctx->drop;
+  GstCaps *caps = gst_pad_get_current_caps(pad);
+  if (caps) {
+    GstVideoInfo vinfo;
+    gst_video_info_init(&vinfo);
+    if (gst_video_info_from_caps(&vinfo, caps) && GST_VIDEO_INFO_FPS_N(&vinfo) > 0) {
+      use_fps_n = GST_VIDEO_INFO_FPS_N(&vinfo);
+      use_fps_d = GST_VIDEO_INFO_FPS_D(&vinfo);
+    }
+    gst_caps_unref(caps);
+  }
+
+  SetFirstFrameResult *result = new SetFirstFrameResult();
+
+  GstVideoTimeCodeFlags flags =
+    use_drop ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
+  GstVideoTimeCode *tc = gst_video_time_code_new(
+    use_fps_n, use_fps_d, NULL, flags, ctx->hh, ctx->mm, ctx->ss, ctx->ff, 0);
+  if (tc) {
+    // Synchronous seed — this is the whole point; it must happen on the
+    // streaming thread before the stamper transforms this buffer.
+    g_object_set(ctx->stamper, "set-internal-timecode", tc, NULL);
+    gchar *s = gst_video_time_code_to_string(tc);
+    result->applied_tc = s ? s : "";
+    if (s) g_free(s);
+    gst_video_time_code_free(tc);
+    result->ok = true;
+    result->fps_n = use_fps_n;
+    result->fps_d = use_fps_d;
+    result->drop = use_drop;
+    result->first_pts =
+      GST_BUFFER_PTS_IS_VALID(buffer) ? GST_BUFFER_PTS(buffer) : GST_CLOCK_TIME_NONE;
+  }
+
+  set_first_frame_settle(ctx, result);
+  return GST_PAD_PROBE_REMOVE; // let this buffer pass; never run again
+}
+
+Napi::Value Element::set_first_frame_timecode(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  if (!element.get()) {
+    Napi::TypeError::New(env, "Element is null or not initialized")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsObject()) {
+    Napi::TypeError::New(env, "setFirstFrameTimecode requires an options object")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object opts = info[0].As<Napi::Object>();
+  if (!opts.Has("timecode") || !opts.Get("timecode").IsObject()) {
+    Napi::TypeError::New(
+      env, "options.timecode { hours, minutes, seconds, frames, dropFrame? } required"
+    ).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object tcObj = opts.Get("timecode").As<Napi::Object>();
+  auto num = [&](Napi::Object o, const char *k, guint def) -> guint {
+    return (o.Has(k) && o.Get(k).IsNumber()) ? o.Get(k).As<Napi::Number>().Uint32Value()
+                                             : def;
+  };
+
+  GstPad *sink_pad = gst_element_get_static_pad(element.get(), "sink");
+  if (!sink_pad) {
+    Napi::Error::New(env, "setFirstFrameTimecode: element has no 'sink' pad")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  SetFirstFrameContext *ctx = new SetFirstFrameContext();
+  ctx->stamper = element.get();
+  ctx->hh = num(tcObj, "hours", 0);
+  ctx->mm = num(tcObj, "minutes", 0);
+  ctx->ss = num(tcObj, "seconds", 0);
+  ctx->ff = num(tcObj, "frames", 0);
+  ctx->drop = tcObj.Has("dropFrame") && tcObj.Get("dropFrame").IsBoolean() &&
+              tcObj.Get("dropFrame").As<Napi::Boolean>().Value();
+  if (opts.Has("rate") && opts.Get("rate").IsObject()) {
+    Napi::Object r = opts.Get("rate").As<Napi::Object>();
+    ctx->fps_n = num(r, "numerator", 0);
+    ctx->fps_d = num(r, "denominator", 1);
+    if (ctx->fps_d == 0) ctx->fps_d = 1;
+  }
+
+  // Promise the caller awaits; resolved from the streaming thread via the TSFN.
+  auto deferred = std::make_shared<Napi::Promise::Deferred>(Napi::Promise::Deferred::New(env));
+
+  // The TSFN's JS callback resolves the deferred with the SetFirstFrameResult.
+  ctx->tsfn = Napi::ThreadSafeFunction::New(
+    env,
+    Napi::Function::New(
+      env,
+      [deferred](const Napi::CallbackInfo &cbinfo) {
+        Napi::Env env = cbinfo.Env();
+        // The result pointer is passed as the first arg via a BigInt handle.
+        auto *r = reinterpret_cast<SetFirstFrameResult *>(
+          cbinfo[0].As<Napi::External<SetFirstFrameResult>>().Data()
+        );
+        if (!r || !r->ok) {
+          deferred->Resolve(env.Null());
+        } else {
+          Napi::Object res = Napi::Object::New(env);
+          res.Set("timecode", Napi::String::New(env, r->applied_tc));
+          if (r->first_pts != GST_CLOCK_TIME_NONE)
+            res.Set("pts", Napi::Number::New(env, static_cast<double>(r->first_pts)));
+          Napi::Object fr = Napi::Object::New(env);
+          fr.Set("numerator", Napi::Number::New(env, r->fps_n));
+          fr.Set("denominator", Napi::Number::New(env, r->fps_d));
+          res.Set("framerate", fr);
+          res.Set("dropFrame", Napi::Boolean::New(env, r->drop));
+          deferred->Resolve(res);
+        }
+        delete r;
+      },
+      "SetFirstFrameResolver"
+    ),
+    "SetFirstFrameTimecode", 0, 1
+  );
+
+  gst_pad_add_probe(
+    sink_pad,
+    static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM),
+    set_first_frame_probe, ctx, [](gpointer data) {
+      // Destroy notify: fires when the probe is removed — including self-remove
+      // after seeding, and pad deactivation on pipeline dispose. If we never
+      // settled (removed before any buffer), resolve with null so the Promise
+      // never hangs. Then free ctx.
+      SetFirstFrameContext *c = static_cast<SetFirstFrameContext *>(data);
+      set_first_frame_settle(c, new SetFirstFrameResult()); // ok=false → null
+      delete c;
+    }
+  );
+  // Drop our pad reference: the probe keeps the pad reachable while it lives, and
+  // holding an extra ref would block the pad from finalizing on dispose, which is
+  // what triggers the destroy notify above. gst_pad_add_probe does not take our
+  // reference.
+  gst_object_unref(sink_pad);
+
+  return deferred->Promise();
 }
 
 Napi::Value Element::push(const Napi::CallbackInfo &info) {
