@@ -60,6 +60,17 @@ console.log("   result:", JSON.stringify(result));
 check("frame-0 label == 10:00:00:30", result && result.timecode === "10:00:00:30");
 check("framerate numerator == 60", result && result.framerate?.numerator === 60);
 
+// Clock-bridge sample: lets a caller map this frame's capture instant onto an
+// external reference clock. captureGstClock = runningTimeNs + baseTimeNs; the
+// (gstClockNs, monotonicNs) pair bridges the GstClock epoch to CLOCK_MONOTONIC.
+const cb = result?.clockBridge ?? {};
+check(
+  "clockBridge sample present",
+  ["runningTimeNs", "baseTimeNs", "gstClockNs", "monotonicNs"].every(
+    k => typeof cb[k] === "number"
+  )
+);
+
 pipeline.dispose();
 
 console.log(failures === 0 ? "\nOVERALL: PASS" : `\nOVERALL: FAIL (${failures})`);

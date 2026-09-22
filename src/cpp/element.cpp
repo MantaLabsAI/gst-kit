@@ -525,6 +525,25 @@ struct SetFirstFrameResult {
   guint64 first_pts = GST_CLOCK_TIME_NONE;
   guint fps_n = 0, fps_d = 1;
   bool drop = false;
+
+  // Clock-bridge fields (all captured together inside the probe, on the
+  // streaming thread, at the first buffer). Let the caller map this frame's
+  // capture instant onto an external reference (e.g. an LTC clock anchored in
+  // the caller's own monotonic domain). All ns. GST_CLOCK_TIME_NONE / 0 when
+  // unavailable (no clock, invalid PTS, unknown segment).
+  //   captureRunningTimeNs = running-time of the frame (segment-mapped PTS)
+  //   baseTimeNs           = the element's base_time
+  //   gstClockNs           = gst_clock_get_time(pipeline clock) at the probe
+  //   monotonicNs          = clock_gettime(CLOCK_MONOTONIC) read adjacent to
+  //                          gstClockNs, so the caller can relate the GstClock
+  //                          epoch to a CLOCK_MONOTONIC domain (Node
+  //                          process.hrtime.bigint is CLOCK_MONOTONIC on Linux).
+  // captureGstClockNs = captureRunningTimeNs + baseTimeNs; the (gstClockNs,
+  // monotonicNs) pair is the epoch bridge sampled at the same instant.
+  guint64 running_time = GST_CLOCK_TIME_NONE;
+  guint64 base_time = GST_CLOCK_TIME_NONE;
+  guint64 gst_clock = GST_CLOCK_TIME_NONE;
+  guint64 monotonic = GST_CLOCK_TIME_NONE;
 };
 
 // Resolve the Promise once, from the JS thread, then release the TSFN so its
@@ -614,6 +633,42 @@ set_first_frame_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
     result->drop = use_drop;
     result->first_pts =
       GST_BUFFER_PTS_IS_VALID(buffer) ? GST_BUFFER_PTS(buffer) : GST_CLOCK_TIME_NONE;
+
+    // Clock-bridge capture — all at this one instant, on the streaming thread.
+    // running-time = segment-mapped PTS (not the raw PTS; a non-zero segment
+    // start would otherwise skew the mapping).
+    if (GST_BUFFER_PTS_IS_VALID(buffer)) {
+      GstEvent *seg_event = gst_pad_get_sticky_event(pad, GST_EVENT_SEGMENT, 0);
+      if (seg_event) {
+        const GstSegment *seg = NULL;
+        gst_event_parse_segment(seg_event, &seg);
+        if (seg && seg->format == GST_FORMAT_TIME) {
+          result->running_time =
+            gst_segment_to_running_time(seg, GST_FORMAT_TIME, GST_BUFFER_PTS(buffer));
+        }
+        gst_event_unref(seg_event);
+      }
+      // If no TIME segment was found, fall back to the raw PTS as running-time
+      // (identity segment) so the field is still usable.
+      if (result->running_time == GST_CLOCK_TIME_NONE)
+        result->running_time = GST_BUFFER_PTS(buffer);
+    }
+
+    result->base_time = gst_element_get_base_time(ctx->stamper);
+
+    GstClock *clock = gst_element_get_clock(ctx->stamper);
+    if (clock) {
+      // Read the GstClock and CLOCK_MONOTONIC adjacent so their difference is
+      // the (stable, on Linux) epoch offset, not scheduling noise.
+      result->gst_clock = gst_clock_get_time(clock);
+      // std::chrono::steady_clock is CLOCK_MONOTONIC on Linux — the same source
+      // as GstSystemClock (GST_CLOCK_TYPE_MONOTONIC) and Node's
+      // process.hrtime.bigint, so the caller's epoch bridge is a stable offset.
+      result->monotonic = (guint64)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+      gst_object_unref(clock);
+    }
   }
 
   set_first_frame_settle(ctx, result);
@@ -693,6 +748,19 @@ Napi::Value Element::set_first_frame_timecode(const Napi::CallbackInfo &info) {
           fr.Set("denominator", Napi::Number::New(env, r->fps_d));
           res.Set("framerate", fr);
           res.Set("dropFrame", Napi::Boolean::New(env, r->drop));
+          // Clock-bridge sample (all ns), omitting fields that were unavailable.
+          // The caller maps captureGstClock = runningTimeNs + baseTimeNs, and
+          // uses (gstClockNs, monotonicNs) as the epoch bridge to its own clock.
+          Napi::Object cb = Napi::Object::New(env);
+          if (r->running_time != GST_CLOCK_TIME_NONE)
+            cb.Set("runningTimeNs", Napi::Number::New(env, static_cast<double>(r->running_time)));
+          if (r->base_time != GST_CLOCK_TIME_NONE)
+            cb.Set("baseTimeNs", Napi::Number::New(env, static_cast<double>(r->base_time)));
+          if (r->gst_clock != GST_CLOCK_TIME_NONE)
+            cb.Set("gstClockNs", Napi::Number::New(env, static_cast<double>(r->gst_clock)));
+          if (r->monotonic != GST_CLOCK_TIME_NONE)
+            cb.Set("monotonicNs", Napi::Number::New(env, static_cast<double>(r->monotonic)));
+          res.Set("clockBridge", cb);
           deferred->Resolve(res);
         }
         delete r;

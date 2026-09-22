@@ -141,6 +141,20 @@ export type SetFirstFrameOptions = {
   monotonicNs?: bigint;
 };
 
+// A clock-bridge sample, captured together inside the probe at the first buffer.
+// Lets the caller map the frame's capture instant onto an external reference
+// clock. All nanoseconds; a field is absent when it was unavailable.
+//   captureGstClockNs = runningTimeNs + baseTimeNs
+//   (gstClockNs, monotonicNs) is an epoch bridge sampled at the same instant —
+//   monotonicNs is CLOCK_MONOTONIC (same source as Node process.hrtime.bigint on
+//   Linux), so the caller can translate a GstClock instant into its own domain.
+export type FirstFrameClockBridge = {
+  runningTimeNs?: number;
+  baseTimeNs?: number;
+  gstClockNs?: number;
+  monotonicNs?: number;
+};
+
 // The applied label, read back from the stamper on the first buffer. Reflects the
 // value actually stamped, at the negotiated rate.
 export type FirstFrameTimecodeResult = {
@@ -148,6 +162,7 @@ export type FirstFrameTimecodeResult = {
   pts?: number; // first-frame PTS (ns)
   framerate: Rational;
   dropFrame: boolean;
+  clockBridge: FirstFrameClockBridge;
 };
 
 export type ElementBase = {

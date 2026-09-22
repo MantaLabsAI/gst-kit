@@ -94,11 +94,18 @@ type SetFirstFrameOptions = {
   rate?: Rational;
   monotonicNs?: bigint;
 };
+type FirstFrameClockBridge = {
+  runningTimeNs?: number;
+  baseTimeNs?: number;
+  gstClockNs?: number;
+  monotonicNs?: number;
+};
 type FirstFrameTimecodeResult = {
   timecode: string;
   pts?: number;
   framerate: Rational;
   dropFrame: boolean;
+  clockBridge: FirstFrameClockBridge;
 };
 type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
@@ -181,4 +188,4 @@ declare const _default: {
   GStreamerPropertyReturnValue: GStreamerPropertyReturnValue;
 };
 //#endregion
-export { AppSinkElement, AppSrcElement, BufferData, ElementBase, FirstFrameTimecodeResult, GStreamerPropertyPrimitiveValue, GStreamerPropertyResult, GStreamerPropertyReturnValue, GStreamerPropertyValue, GStreamerSample, GstBufferFlags, GstMessage, GstPad, PipelineClass as Pipeline, RTPData, Rational, SetFirstFrameOptions, StateChangeResult, TimecodeValue, _default as default };
+export { AppSinkElement, AppSrcElement, BufferData, ElementBase, FirstFrameClockBridge, FirstFrameTimecodeResult, GStreamerPropertyPrimitiveValue, GStreamerPropertyResult, GStreamerPropertyReturnValue, GStreamerPropertyValue, GStreamerSample, GstBufferFlags, GstMessage, GstPad, PipelineClass as Pipeline, RTPData, Rational, SetFirstFrameOptions, StateChangeResult, TimecodeValue, _default as default };
