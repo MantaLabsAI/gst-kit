@@ -93,4 +93,46 @@ describe.skipIf(!hasTimecodeStamper)("setFirstFrameTimecode baseTimeElement", ()
     // clearly SMALLER than controlBase (which came from a later-started pipeline).
     expect(earlyBase!).toBeLessThan(controlBase!);
   });
+
+  it("reports baseClockMatched when no baseTimeElement is supplied (defaults to the stamper)", async () => {
+    const rec = new Pipeline(
+      "videotestsrc num-buffers=10 is-live=true ! timecodestamper name=tc_stamper ! fakesink",
+    );
+    const stamper = rec.getElementByName("tc_stamper");
+    if (!stamper) throw new Error("stamper not found");
+    const prom = stamper.setFirstFrameTimecode({
+      timecode: { hours: 10, minutes: 0, seconds: 0, frames: 0 },
+    });
+    await rec.play(5000);
+    const result = await prom;
+    // No base element → base and clock both come from the stamper, so they match.
+    expect(result?.clockBridge.baseClockMatched).toBe(true);
+    await rec.stop();
+    rec.dispose();
+  });
+
+  it("reports baseClockMatched=true when the base element shares the stamper's clock (separate pipelines on the system clock)", async () => {
+    // ARK's real case: ingest and recording pipelines both run on the global
+    // GstSystemClock, so a base element from the other pipeline still shares the
+    // stamper's clock and the base-time subtraction is valid.
+    const rec = new Pipeline(
+      "videotestsrc num-buffers=10 is-live=true ! timecodestamper name=tc_stamper ! fakesink",
+    );
+    const ext = new Pipeline("videotestsrc is-live=true ! fakesink name=fsExt");
+    const stamper = rec.getElementByName("tc_stamper");
+    const extEl = ext.getElementByName("fsExt");
+    if (!stamper || !extEl) throw new Error("elements not found");
+    await ext.play(5000);
+    const prom = stamper.setFirstFrameTimecode({
+      timecode: { hours: 10, minutes: 0, seconds: 0, frames: 0 },
+      baseTimeElement: extEl,
+    });
+    await rec.play(5000);
+    const result = await prom;
+    expect(result?.clockBridge.baseClockMatched).toBe(true);
+    await rec.stop();
+    await ext.stop();
+    rec.dispose();
+    ext.dispose();
+  });
 });

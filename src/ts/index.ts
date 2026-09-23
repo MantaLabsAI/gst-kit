@@ -155,11 +155,15 @@ export type SetFirstFrameOptions = {
 //   (gstClockNs, monotonicNs) is an epoch bridge sampled at the same instant —
 //   monotonicNs is CLOCK_MONOTONIC (same source as Node process.hrtime.bigint on
 //   Linux), so the caller can translate a GstClock instant into its own domain.
+//   baseClockMatched is whether baseTimeElement shares the stamper's GstClock, so
+//   baseTimeNs is comparable to that epoch bridge; true when no baseTimeElement
+//   was supplied, false ⇒ different clock domain, do not map.
 export type FirstFrameClockBridge = {
   runningTimeNs?: number;
   baseTimeNs?: number;
   gstClockNs?: number;
   monotonicNs?: number;
+  baseClockMatched?: boolean;
 };
 
 // The applied label, read back from the stamper on the first buffer. Reflects the

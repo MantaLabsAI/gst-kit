@@ -544,12 +544,17 @@ struct SetFirstFrameResult {
   //                          gstClockNs, so the caller can relate the GstClock
   //                          epoch to a CLOCK_MONOTONIC domain (Node
   //                          process.hrtime.bigint is CLOCK_MONOTONIC on Linux).
+  //   base_clock_matched   = whether base_time's element shares the stamper's
+  //                          clock; false ⇒ base is in another clock domain than
+  //                          the epoch bridge, do not map (true when no
+  //                          base_time_source was supplied).
   // captureGstClockNs = captureRunningTimeNs + baseTimeNs; the (gstClockNs,
   // monotonicNs) pair is the epoch bridge sampled at the same instant.
   guint64 running_time = GST_CLOCK_TIME_NONE;
   guint64 base_time = GST_CLOCK_TIME_NONE;
   guint64 gst_clock = GST_CLOCK_TIME_NONE;
   guint64 monotonic = GST_CLOCK_TIME_NONE;
+  bool base_clock_matched = true;
 };
 
 // Resolve the Promise once, from the JS thread, then release the TSFN so its
@@ -681,6 +686,16 @@ set_first_frame_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
       result->monotonic = (guint64)std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now().time_since_epoch())
                             .count();
+
+      // base_time is only comparable to this (stamper) clock's epoch
+      // bridge when base_src runs on the SAME GstClock — verify by GstClock
+      // identity rather than assume it. The caller refuses the mapping when false.
+      if (ctx->base_time_source && ctx->base_time_source != ctx->stamper) {
+        GstClock *base_clock = gst_element_get_clock(base_src);
+        result->base_clock_matched = (base_clock == clock);
+        if (base_clock) gst_object_unref(base_clock);
+      }
+
       gst_object_unref(clock);
     }
   }
@@ -789,6 +804,7 @@ Napi::Value Element::set_first_frame_timecode(const Napi::CallbackInfo &info) {
             cb.Set("gstClockNs", Napi::Number::New(env, static_cast<double>(r->gst_clock)));
           if (r->monotonic != GST_CLOCK_TIME_NONE)
             cb.Set("monotonicNs", Napi::Number::New(env, static_cast<double>(r->monotonic)));
+          cb.Set("baseClockMatched", Napi::Boolean::New(env, r->base_clock_matched));
           res.Set("clockBridge", cb);
           deferred->Resolve(res);
         }

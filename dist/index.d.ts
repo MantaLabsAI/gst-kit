@@ -100,6 +100,7 @@ type FirstFrameClockBridge = {
   baseTimeNs?: number;
   gstClockNs?: number;
   monotonicNs?: number;
+  baseClockMatched?: boolean;
 };
 type FirstFrameTimecodeResult = {
   timecode: string;
