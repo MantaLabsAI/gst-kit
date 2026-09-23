@@ -93,6 +93,7 @@ type SetFirstFrameOptions = {
   timecode: TimecodeValue;
   rate?: Rational;
   monotonicNs?: bigint;
+  baseTimeElement?: ElementBase;
 };
 type FirstFrameClockBridge = {
   runningTimeNs?: number;

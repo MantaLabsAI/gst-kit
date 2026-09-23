@@ -139,6 +139,13 @@ export type SetFirstFrameOptions = {
   // Monotonic instant of the reference snapshot, same domain as the pipeline
   // clock. Reserved for a caller-side clock bridge; unused by the seed itself.
   monotonicNs?: bigint;
+  // Element whose base_time the clock bridge should report. Pass the
+  // element of the pipeline the first buffer's running-time is relative to, so
+  // `runningTimeNs + baseTimeNs` stays in one domain. Under interpipe
+  // passthrough-ts that is the INGEST pipeline's element; omit it and the probe
+  // uses this (the stamper's) base time — correct for compensate-ts. Both
+  // pipelines must share one GstClock for the mapping to be valid.
+  baseTimeElement?: ElementBase;
 };
 
 // A clock-bridge sample, captured together inside the probe at the first buffer.

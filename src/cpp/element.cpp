@@ -506,6 +506,12 @@ Napi::Value Element::add_pad_probe(const Napi::CallbackInfo &info) {
 struct SetFirstFrameContext {
   std::mutex mutex;
   GstElement *stamper = nullptr; // borrowed (owned by the Element/pipeline)
+  // Optional base-time source. When set, the probe reads its
+  // base_time instead of the stamper's, so a caller whose frame running-time is
+  // relative to a DIFFERENT pipeline (e.g. the ingest pipeline under interpipe
+  // passthrough-ts) can still map `runningTimeNs + baseTimeNs` in one domain.
+  // Owned: gst_object_ref'd on register, unref'd in the destroy notify.
+  GstElement *base_time_source = nullptr;
   bool settled = false; // the Promise has been (or is being) resolved exactly once
 
   // requested seed
@@ -654,7 +660,15 @@ set_first_frame_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
         result->running_time = GST_BUFFER_PTS(buffer);
     }
 
-    result->base_time = gst_element_get_base_time(ctx->stamper);
+    // Base time is read from the caller-supplied source when present,
+    // otherwise the stamper. `runningTimeNs` is relative to whichever pipeline
+    // produced the buffer's timestamps; the caller passes the element of THAT
+    // pipeline so `runningTimeNs + baseTimeNs` stays in one domain. The clock
+    // (below) is still read from the stamper: the epoch bridge is a GstClock
+    // property, and the mapping is only valid when both pipelines share one
+    // GstClock (the caller asserts this).
+    GstElement *base_src = ctx->base_time_source ? ctx->base_time_source : ctx->stamper;
+    result->base_time = gst_element_get_base_time(base_src);
 
     GstClock *clock = gst_element_get_clock(ctx->stamper);
     if (clock) {
@@ -722,6 +736,21 @@ Napi::Value Element::set_first_frame_timecode(const Napi::CallbackInfo &info) {
     if (ctx->fps_d == 0) ctx->fps_d = 1;
   }
 
+  // Optional base-time source element. When the caller's frame
+  // running-time is relative to another pipeline (interpipe passthrough-ts),
+  // pass that pipeline's element so the probe reads ITS base time. Unwrap the
+  // JS Element and take an owning ref for the probe's lifetime; the destroy
+  // notify releases it. Absent → the probe uses the stamper's base time (the
+  // prior behaviour, correct for compensate-ts / audio-present).
+  if (opts.Has("baseTimeElement") && opts.Get("baseTimeElement").IsObject()) {
+    Napi::Object beObj = opts.Get("baseTimeElement").As<Napi::Object>();
+    Element *beWrap = Napi::ObjectWrap<Element>::Unwrap(beObj);
+    if (beWrap && beWrap->element.get()) {
+      ctx->base_time_source =
+        static_cast<GstElement *>(gst_object_ref(beWrap->element.get()));
+    }
+  }
+
   // Promise the caller awaits; resolved from the streaming thread via the TSFN.
   auto deferred = std::make_shared<Napi::Promise::Deferred>(Napi::Promise::Deferred::New(env));
 
@@ -780,6 +809,7 @@ Napi::Value Element::set_first_frame_timecode(const Napi::CallbackInfo &info) {
       // never hangs. Then free ctx.
       SetFirstFrameContext *c = static_cast<SetFirstFrameContext *>(data);
       set_first_frame_settle(c, new SetFirstFrameResult()); // ok=false → null
+      if (c->base_time_source) gst_object_unref(c->base_time_source);
       delete c;
     }
   );
