@@ -32,7 +32,7 @@
                 "VCLinkerTool": {
                     "SetChecksum": "true",
                     "AdditionalLibraryDirectories": [
-                        "<!@(node -p \"require('child_process').execSync('pkg-config --libs-only-L gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0 glib-2.0 gobject-2.0').toString().trim().split('-L').slice(1).map(f => f.trim().replace(/\\\\\\\\ /g, ' ')).join(';')\")"
+                        "<!@(node -p \"require('child_process').execSync('pkg-config --libs-only-L gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0 gstreamer-video-1.0 glib-2.0 gobject-2.0').toString().trim().split('-L').slice(1).map(f => f.trim().replace(/\\\\\\\\ /g, ' ')).join(';')\")"
                     ],
                 },
             },
@@ -42,6 +42,7 @@
                 "<!@(node -p \"require('child_process').execSync('pkg-config --cflags-only-I gstreamer-1.0').toString().trim().split(/\\s+/).map(f => f.replace(/^-I/, '')).join(' ')\")",
                 "<!@(node -p \"require('child_process').execSync('pkg-config --cflags-only-I gstreamer-app-1.0').toString().trim().split(/\\s+/).map(f => f.replace(/^-I/, '')).join(' ')\")",
                 "<!@(node -p \"require('child_process').execSync('pkg-config --cflags-only-I gstreamer-rtp-1.0').toString().trim().split(/\\s+/).map(f => f.replace(/^-I/, '')).join(' ')\")",
+                "<!@(node -p \"require('child_process').execSync('pkg-config --cflags-only-I gstreamer-video-1.0').toString().trim().split(/\\s+/).map(f => f.replace(/^-I/, '')).join(' ')\")",
                 "<!@(node -p \"require('child_process').execSync('pkg-config --cflags-only-I glib-2.0').toString().trim().split(/\\s+/).map(f => f.replace(/^-I/, '')).join(' ')\")",
                 "<!@(node -p \"require('child_process').execSync('pkg-config --cflags-only-I gobject-2.0').toString().trim().split(/\\s+/).map(f => f.replace(/^-I/, '')).join(' ')\")",
             ],
@@ -50,7 +51,7 @@
                     "OS=='win'",
                     {
                         "libraries": [
-                            "<!@(node -p \"require('child_process').execSync('pkg-config --libs-only-l gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0 glib-2.0 gobject-2.0').toString().trim().split(/\\s+/).map(f => f.replace(/^-l/, '') + '.lib').filter(f => f !== '.lib').join(' ')\")"
+                            "<!@(node -p \"require('child_process').execSync('pkg-config --libs-only-l gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0 gstreamer-video-1.0 glib-2.0 gobject-2.0').toString().trim().split(/\\s+/).map(f => f.replace(/^-l/, '') + '.lib').filter(f => f !== '.lib').join(' ')\")"
                         ]
                     },
                 ],
@@ -58,7 +59,7 @@
                     "OS!='win'",
                     {
                         "libraries": [
-                            "<!@(node -p \"require('child_process').execSync('pkg-config --libs-only-l gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0 glib-2.0 gobject-2.0').toString().trim()\")"
+                            "<!@(node -p \"require('child_process').execSync('pkg-config --libs-only-l gstreamer-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0 gstreamer-video-1.0 glib-2.0 gobject-2.0').toString().trim()\")"
                         ]
                     },
                 ],

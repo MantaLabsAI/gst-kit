@@ -141,6 +141,36 @@ export type FirstFrameClockSample = {
   baseClockMatched?: boolean;
 };
 
+export type Rational = { numerator: number; denominator: number };
+
+export type TimecodeValue = {
+  hours: number;
+  minutes: number;
+  seconds: number;
+  frames: number;
+  dropFrame?: boolean;
+};
+
+export type SetFirstFrameTimecodeOptions = {
+  // The label to stamp on the first recorded frame (already computed by the caller).
+  timecode: TimecodeValue;
+  // Output/negotiated frame rate. If omitted, read from the negotiated caps.
+  rate?: Rational;
+  // Base-time element for the clock bridge, as in sampleFirstFrameClock; omit to
+  // use the stamper's own base.
+  baseTimeElement?: ElementBase;
+};
+
+// The label actually stamped on the first buffer (at the negotiated rate), plus
+// the clock bridge sampleFirstFrameClock returns.
+export type FirstFrameTimecodeResult = {
+  timecode: string; // "HH:MM:SS:FF" / "HH:MM:SS;FF"
+  pts?: number; // first-frame PTS (ns)
+  framerate: Rational;
+  dropFrame: boolean;
+  clockBridge: FirstFrameClockSample;
+};
+
 export type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
   setElementProperty: (key: string, value: GStreamerPropertyValue) => void;
@@ -148,6 +178,9 @@ export type ElementBase = {
   sampleFirstFrameClock: (
     options?: SampleFirstFrameClockOptions,
   ) => Promise<FirstFrameClockSample | null>;
+  setFirstFrameTimecode: (
+    options: SetFirstFrameTimecodeOptions,
+  ) => Promise<FirstFrameTimecodeResult | null>;
   setPad: (attribute: string, padName: string) => void;
   getPad: (padName: string) => GstPad | null;
 };

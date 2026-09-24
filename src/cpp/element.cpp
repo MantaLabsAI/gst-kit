@@ -3,7 +3,9 @@
 #include "type-conversion.hpp"
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <gst/rtp/gstrtpbuffer.h>
+#include <gst/video/video.h>
 #include <memory>
 #include <string>
 #include <thread>
@@ -65,6 +67,13 @@ Element::Element(const Napi::CallbackInfo &info) :
     },
     "sampleFirstFrameClock"
   );
+  auto set_first_frame_timecode_method = Napi::Function::New(
+    env,
+    [this](const Napi::CallbackInfo &info) -> Napi::Value {
+      return this->set_first_frame_timecode(info);
+    },
+    "setFirstFrameTimecode"
+  );
   auto set_pad_method = Napi::Function::New(
     env, [this](const Napi::CallbackInfo &info) -> Napi::Value { return this->set_pad(info); },
     "setPad"
@@ -93,6 +102,9 @@ Element::Element(const Napi::CallbackInfo &info) :
     Napi::PropertyDescriptor::Value("addPadProbe", add_pad_probe_method, napi_enumerable),
     Napi::PropertyDescriptor::Value(
       "sampleFirstFrameClock", sample_first_frame_clock_method, napi_enumerable
+    ),
+    Napi::PropertyDescriptor::Value(
+      "setFirstFrameTimecode", set_first_frame_timecode_method, napi_enumerable
     ),
     Napi::PropertyDescriptor::Value("setPad", set_pad_method, napi_enumerable),
     Napi::PropertyDescriptor::Value("getPad", get_pad_method, napi_enumerable)
@@ -504,6 +516,14 @@ struct FirstFrameClockContext {
   GstElement *base_time_source = nullptr;
   bool settled = false; // resolve exactly once
   Napi::ThreadSafeFunction tsfn;
+
+  // Optional first-frame stamp (setFirstFrameTimecode): when set, seed `element`
+  // (a timecodestamper) with these fields before it transforms the first buffer.
+  // fps 0/1 → read the negotiated caps rate.
+  bool has_stamp = false;
+  guint stamp_fps_n = 0, stamp_fps_d = 1;
+  bool stamp_drop = false;
+  guint stamp_hh = 0, stamp_mm = 0, stamp_ss = 0, stamp_ff = 0;
 };
 
 // Clock-bridge sample carried to the JS resolver. All ns; GST_CLOCK_TIME_NONE
@@ -516,6 +536,13 @@ struct FirstFrameClockSample {
   guint64 gst_clock = GST_CLOCK_TIME_NONE;
   guint64 monotonic = GST_CLOCK_TIME_NONE;
   bool base_clock_matched = true; // false ⇒ base_time_source on a different clock
+  // Stamp result (setFirstFrameTimecode only): the label applied to frame 0, at
+  // the negotiated rate.
+  bool stamped = false;
+  std::string applied_tc;
+  guint64 first_pts = GST_CLOCK_TIME_NONE;
+  guint applied_fps_n = 0, applied_fps_d = 1;
+  bool applied_drop = false;
 };
 
 // Resolve the Promise once, from the JS thread, then release the TSFN. Idempotent
@@ -567,6 +594,42 @@ first_frame_clock_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) 
   FirstFrameClockSample *sample = new FirstFrameClockSample();
   sample->ok = true;
 
+  // Optional first-frame stamp: seed the stamper synchronously here, before it
+  // transforms this buffer. Prefer the negotiated caps rate over the requested one
+  // so the applied label matches what the stamper counts at.
+  if (ctx->has_stamp) {
+    guint use_fps_n = ctx->stamp_fps_n, use_fps_d = ctx->stamp_fps_d;
+    bool use_drop = ctx->stamp_drop;
+    GstCaps *caps = gst_pad_get_current_caps(pad);
+    if (caps) {
+      GstVideoInfo vinfo;
+      gst_video_info_init(&vinfo);
+      if (gst_video_info_from_caps(&vinfo, caps) && GST_VIDEO_INFO_FPS_N(&vinfo) > 0) {
+        use_fps_n = GST_VIDEO_INFO_FPS_N(&vinfo);
+        use_fps_d = GST_VIDEO_INFO_FPS_D(&vinfo);
+      }
+      gst_caps_unref(caps);
+    }
+    GstVideoTimeCodeFlags flags =
+      use_drop ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
+    GstVideoTimeCode *tc = gst_video_time_code_new(
+      use_fps_n, use_fps_d, NULL, flags,
+      ctx->stamp_hh, ctx->stamp_mm, ctx->stamp_ss, ctx->stamp_ff, 0);
+    if (tc) {
+      g_object_set(ctx->element, "set-internal-timecode", tc, NULL);
+      gchar *s = gst_video_time_code_to_string(tc);
+      sample->applied_tc = s ? s : "";
+      if (s) g_free(s);
+      gst_video_time_code_free(tc);
+      sample->stamped = true;
+      sample->applied_fps_n = use_fps_n;
+      sample->applied_fps_d = use_fps_d;
+      sample->applied_drop = use_drop;
+      sample->first_pts =
+        GST_BUFFER_PTS_IS_VALID(buffer) ? GST_BUFFER_PTS(buffer) : GST_CLOCK_TIME_NONE;
+    }
+  }
+
   // running-time = segment-mapped PTS; fall back to the raw PTS (identity segment)
   // when there is no TIME segment.
   if (GST_BUFFER_PTS_IS_VALID(buffer)) {
@@ -613,45 +676,53 @@ first_frame_clock_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) 
   return GST_PAD_PROBE_REMOVE; // one buffer only
 }
 
-Napi::Value Element::sample_first_frame_clock(const Napi::CallbackInfo &info) {
-  Napi::Env env = info.Env();
-  if (!element.get()) {
-    Napi::TypeError::New(env, "Element is null or not initialized")
-      .ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
+// Build the clock-bridge JS object from a sample, omitting fields that were
+// unavailable. Shared by both first-frame entry points.
+static Napi::Object first_frame_build_clock_bridge(
+  Napi::Env env, const FirstFrameClockSample *s
+) {
+  Napi::Object cb = Napi::Object::New(env);
+  if (s->running_time != GST_CLOCK_TIME_NONE)
+    cb.Set("runningTimeNs", Napi::Number::New(env, static_cast<double>(s->running_time)));
+  if (s->base_time != GST_CLOCK_TIME_NONE)
+    cb.Set("baseTimeNs", Napi::Number::New(env, static_cast<double>(s->base_time)));
+  if (s->gst_clock != GST_CLOCK_TIME_NONE)
+    cb.Set("gstClockNs", Napi::Number::New(env, static_cast<double>(s->gst_clock)));
+  if (s->monotonic != GST_CLOCK_TIME_NONE)
+    cb.Set("monotonicNs", Napi::Number::New(env, static_cast<double>(s->monotonic)));
+  cb.Set("baseClockMatched", Napi::Boolean::New(env, s->base_clock_matched));
+  return cb;
+}
 
-  GstPad *sink_pad = gst_element_get_static_pad(element.get(), "sink");
+// Register the single-shot probe and wire its TSFN resolver. Shared by both entry
+// points; `resolve_ok` builds each API's result shape from the same sample.
+// Returns the Promise, or throws (and frees ctx) when there is no sink pad.
+static Napi::Value first_frame_register_probe(
+  Napi::Env env,
+  GstElement *element,
+  const char *method_name,
+  FirstFrameClockContext *ctx,
+  std::function<void(Napi::Env, Napi::Promise::Deferred &, const FirstFrameClockSample *)>
+    resolve_ok
+) {
+  GstPad *sink_pad = gst_element_get_static_pad(element, "sink");
   if (!sink_pad) {
-    Napi::Error::New(env, "sampleFirstFrameClock: element has no 'sink' pad")
+    if (ctx->base_time_source) gst_object_unref(ctx->base_time_source);
+    delete ctx;
+    Napi::Error::New(env, std::string(method_name) + ": element has no 'sink' pad")
       .ThrowAsJavaScriptException();
     return env.Undefined();
-  }
-
-  FirstFrameClockContext *ctx = new FirstFrameClockContext();
-  ctx->element = element.get();
-
-  // Optional base-time source; take an owning ref for the probe's lifetime
-  // (released in the destroy notify).
-  if (info.Length() >= 1 && info[0].IsObject()) {
-    Napi::Object opts = info[0].As<Napi::Object>();
-    if (opts.Has("baseTimeElement") && opts.Get("baseTimeElement").IsObject()) {
-      Napi::Object beObj = opts.Get("baseTimeElement").As<Napi::Object>();
-      Element *beWrap = Napi::ObjectWrap<Element>::Unwrap(beObj);
-      if (beWrap && beWrap->element.get()) {
-        ctx->base_time_source =
-          static_cast<GstElement *>(gst_object_ref(beWrap->element.get()));
-      }
-    }
   }
 
   auto deferred = std::make_shared<Napi::Promise::Deferred>(Napi::Promise::Deferred::New(env));
+  auto resolve_ok_ptr =
+    std::make_shared<decltype(resolve_ok)>(std::move(resolve_ok));
 
   ctx->tsfn = Napi::ThreadSafeFunction::New(
     env,
     Napi::Function::New(
       env,
-      [deferred](const Napi::CallbackInfo &cbinfo) {
+      [deferred, resolve_ok_ptr](const Napi::CallbackInfo &cbinfo) {
         Napi::Env env = cbinfo.Env();
         auto *s = reinterpret_cast<FirstFrameClockSample *>(
           cbinfo[0].As<Napi::External<FirstFrameClockSample>>().Data()
@@ -659,23 +730,13 @@ Napi::Value Element::sample_first_frame_clock(const Napi::CallbackInfo &info) {
         if (!s || !s->ok) {
           deferred->Resolve(env.Null());
         } else {
-          Napi::Object res = Napi::Object::New(env);
-          if (s->running_time != GST_CLOCK_TIME_NONE)
-            res.Set("runningTimeNs", Napi::Number::New(env, static_cast<double>(s->running_time)));
-          if (s->base_time != GST_CLOCK_TIME_NONE)
-            res.Set("baseTimeNs", Napi::Number::New(env, static_cast<double>(s->base_time)));
-          if (s->gst_clock != GST_CLOCK_TIME_NONE)
-            res.Set("gstClockNs", Napi::Number::New(env, static_cast<double>(s->gst_clock)));
-          if (s->monotonic != GST_CLOCK_TIME_NONE)
-            res.Set("monotonicNs", Napi::Number::New(env, static_cast<double>(s->monotonic)));
-          res.Set("baseClockMatched", Napi::Boolean::New(env, s->base_clock_matched));
-          deferred->Resolve(res);
+          (*resolve_ok_ptr)(env, *deferred, s);
         }
         delete s;
       },
-      "FirstFrameClockResolver"
+      "FirstFrameResolver"
     ),
-    "SampleFirstFrameClock", 0, 1
+    method_name, 0, 1
   );
 
   gst_pad_add_probe(
@@ -695,6 +756,106 @@ Napi::Value Element::sample_first_frame_clock(const Napi::CallbackInfo &info) {
   gst_object_unref(sink_pad);
 
   return deferred->Promise();
+}
+
+GstElement *Element::unwrap_base_time_element(const Napi::Object &opts) {
+  if (opts.Has("baseTimeElement") && opts.Get("baseTimeElement").IsObject()) {
+    Napi::Object beObj = opts.Get("baseTimeElement").As<Napi::Object>();
+    Element *beWrap = Napi::ObjectWrap<Element>::Unwrap(beObj);
+    if (beWrap && beWrap->element.get()) {
+      return beWrap->element.get();
+    }
+  }
+  return nullptr;
+}
+
+Napi::Value Element::sample_first_frame_clock(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  if (!element.get()) {
+    Napi::TypeError::New(env, "Element is null or not initialized")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  FirstFrameClockContext *ctx = new FirstFrameClockContext();
+  ctx->element = element.get();
+
+  // Optional base-time source; take an owning ref for the probe's lifetime
+  // (released in the destroy notify).
+  if (info.Length() >= 1 && info[0].IsObject()) {
+    GstElement *base = unwrap_base_time_element(info[0].As<Napi::Object>());
+    if (base) ctx->base_time_source = static_cast<GstElement *>(gst_object_ref(base));
+  }
+
+  // sampleFirstFrameClock resolves the clock bridge flat.
+  return first_frame_register_probe(
+    env, element.get(), "sampleFirstFrameClock", ctx,
+    [](Napi::Env env, Napi::Promise::Deferred &deferred, const FirstFrameClockSample *s) {
+      deferred.Resolve(first_frame_build_clock_bridge(env, s));
+    }
+  );
+}
+
+Napi::Value Element::set_first_frame_timecode(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  if (!element.get()) {
+    Napi::TypeError::New(env, "Element is null or not initialized")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsObject()) {
+    Napi::TypeError::New(env, "setFirstFrameTimecode requires an options object")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object opts = info[0].As<Napi::Object>();
+  if (!opts.Has("timecode") || !opts.Get("timecode").IsObject()) {
+    Napi::TypeError::New(
+      env, "options.timecode { hours, minutes, seconds, frames, dropFrame? } required"
+    ).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object tcObj = opts.Get("timecode").As<Napi::Object>();
+  auto num = [&](Napi::Object o, const char *k, guint def) -> guint {
+    return (o.Has(k) && o.Get(k).IsNumber()) ? o.Get(k).As<Napi::Number>().Uint32Value() : def;
+  };
+
+  FirstFrameClockContext *ctx = new FirstFrameClockContext();
+  ctx->element = element.get();
+  // The stamp the probe applies to frame 0. fps 0/1 → read from negotiated caps.
+  ctx->has_stamp = true;
+  ctx->stamp_hh = num(tcObj, "hours", 0);
+  ctx->stamp_mm = num(tcObj, "minutes", 0);
+  ctx->stamp_ss = num(tcObj, "seconds", 0);
+  ctx->stamp_ff = num(tcObj, "frames", 0);
+  ctx->stamp_drop = tcObj.Has("dropFrame") && tcObj.Get("dropFrame").IsBoolean() &&
+                    tcObj.Get("dropFrame").As<Napi::Boolean>().Value();
+  if (opts.Has("rate") && opts.Get("rate").IsObject()) {
+    Napi::Object r = opts.Get("rate").As<Napi::Object>();
+    ctx->stamp_fps_n = num(r, "numerator", 0);
+    ctx->stamp_fps_d = num(r, "denominator", 1);
+    if (ctx->stamp_fps_d == 0) ctx->stamp_fps_d = 1;
+  }
+  GstElement *base = unwrap_base_time_element(opts);
+  if (base) ctx->base_time_source = static_cast<GstElement *>(gst_object_ref(base));
+
+  // setFirstFrameTimecode resolves the applied label plus the clock bridge nested.
+  return first_frame_register_probe(
+    env, element.get(), "setFirstFrameTimecode", ctx,
+    [](Napi::Env env, Napi::Promise::Deferred &deferred, const FirstFrameClockSample *s) {
+      Napi::Object res = Napi::Object::New(env);
+      res.Set("timecode", Napi::String::New(env, s->applied_tc));
+      if (s->first_pts != GST_CLOCK_TIME_NONE)
+        res.Set("pts", Napi::Number::New(env, static_cast<double>(s->first_pts)));
+      Napi::Object fr = Napi::Object::New(env);
+      fr.Set("numerator", Napi::Number::New(env, s->applied_fps_n));
+      fr.Set("denominator", Napi::Number::New(env, s->applied_fps_d));
+      res.Set("framerate", fr);
+      res.Set("dropFrame", Napi::Boolean::New(env, s->applied_drop));
+      res.Set("clockBridge", first_frame_build_clock_bridge(env, s));
+      deferred.Resolve(res);
+    }
+  );
 }
 
 Napi::Value Element::push(const Napi::CallbackInfo &info) {

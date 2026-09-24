@@ -1,7 +1,66 @@
 #include "type-conversion.hpp"
+#include <cstdio>
 #include <gst/gst.h>
+#include <gst/video/video.h>
 
 namespace TypeConversion {
+  // Build a boxed GstVideoTimeCode into out_value from a structured JS object
+  // { hours, minutes, seconds, frames, dropFrame?, fpsN?, fpsD? } or an
+  // "HH:MM:SS[:;]FF" string. Only H:M:S:F and drop-frame matter for
+  // set-internal-timecode; the stamper derives fps/flags from caps.
+  static bool build_video_time_code_from_js(
+    const Napi::Value &js_value, GValue *out_value
+  ) {
+    if (js_value.IsObject() && !js_value.IsString()) {
+      Napi::Object o = js_value.As<Napi::Object>();
+      auto has_num = [&](const char *k) { return o.Has(k) && o.Get(k).IsNumber(); };
+      if (!has_num("hours") || !has_num("minutes") || !has_num("seconds") ||
+          !has_num("frames")) {
+        return false;
+      }
+      guint hours = o.Get("hours").As<Napi::Number>().Uint32Value();
+      guint minutes = o.Get("minutes").As<Napi::Number>().Uint32Value();
+      guint seconds = o.Get("seconds").As<Napi::Number>().Uint32Value();
+      guint frames = o.Get("frames").As<Napi::Number>().Uint32Value();
+      bool drop = o.Has("dropFrame") && o.Get("dropFrame").IsBoolean() &&
+                  o.Get("dropFrame").As<Napi::Boolean>().Value();
+      guint fps_n = has_num("fpsN") ? o.Get("fpsN").As<Napi::Number>().Uint32Value() : 0;
+      guint fps_d = has_num("fpsD") ? o.Get("fpsD").As<Napi::Number>().Uint32Value() : 1;
+      if (fps_d == 0) fps_d = 1;
+
+      GstVideoTimeCodeFlags flags =
+        drop ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
+      GstVideoTimeCode *tc =
+        gst_video_time_code_new(fps_n, fps_d, NULL, flags, hours, minutes, seconds, frames, 0);
+      if (!tc) return false;
+      g_value_set_boxed(out_value, tc); // copies
+      gst_video_time_code_free(tc);
+      return true;
+    }
+
+    if (js_value.IsString()) {
+      std::string s = js_value.As<Napi::String>().Utf8Value();
+      if (s.size() != 11) return false;
+      if (s[8] != ':' && s[8] != ';') return false;
+      bool drop = s[8] == ';';
+      int hh, mm, ss, ff;
+      char sep;
+      if (std::sscanf(s.c_str(), "%2d:%2d:%2d%c%2d", &hh, &mm, &ss, &sep, &ff) != 5)
+        return false;
+      if (hh < 0 || mm < 0 || ss < 0 || ff < 0) return false;
+      GstVideoTimeCodeFlags flags =
+        drop ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
+      GstVideoTimeCode *tc = gst_video_time_code_new(
+        0, 1, NULL, flags, (guint)hh, (guint)mm, (guint)ss, (guint)ff, 0);
+      if (!tc) return false;
+      g_value_set_boxed(out_value, tc);
+      gst_video_time_code_free(tc);
+      return true;
+    }
+
+    return false;
+  }
+
   bool js_to_gvalue(
     const Napi::Env &env, const Napi::Value &js_value, GType target_type, GValue *out_value
   ) {
@@ -88,6 +147,14 @@ namespace TypeConversion {
           }
           g_value_set_boxed(out_value, caps);
           gst_caps_unref(caps);
+          return true;
+        } else if (target_type == gst_video_time_code_get_type()) {
+          // Boxed GstVideoTimeCode (e.g. timecodestamper set-internal-timecode).
+          // Accept a structured object or an "HH:MM:SS[:;]FF" string.
+          if (!build_video_time_code_from_js(js_value, out_value)) {
+            g_value_unset(out_value);
+            return false;
+          }
           return true;
         } else if (G_TYPE_IS_ENUM(target_type)) {
           // Handle enum types
