@@ -159,6 +159,15 @@ export type SetFirstFrameTimecodeOptions = {
   // Base-time element for the clock bridge, as in sampleFirstFrameClock; omit to
   // use the stamper's own base.
   baseTimeElement?: ElementBase;
+  // The time `timecode` was read, in CLOCK_MONOTONIC ns (the same clock as
+  // clockBridge.monotonicNs). `timecode` is correct at this time, but the first
+  // frame arrives a bit later, so we add the frames that pass in between and stamp
+  // that later value — the label then matches the frame it lands on. `timecode`
+  // must use the video's frame rate. Leave this out to stamp `timecode` as given.
+  captureAnchor?: {
+    // The time `timecode` was read, in CLOCK_MONOTONIC ns.
+    anchoredAtNs: number;
+  };
 };
 
 // The label actually stamped on the first buffer (at the negotiated rate), plus
@@ -168,6 +177,9 @@ export type FirstFrameTimecodeResult = {
   pts?: number; // first-frame PTS (ns)
   framerate: Rational;
   dropFrame: boolean;
+  // Frames the label was advanced from the seed to reach the capture instant; 0
+  // when no captureAnchor was supplied or the advance was skipped.
+  advancedFrames: number;
   clockBridge: FirstFrameClockSample;
 };
 

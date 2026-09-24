@@ -103,12 +103,16 @@ type SetFirstFrameTimecodeOptions = {
   timecode: TimecodeValue;
   rate?: Rational;
   baseTimeElement?: ElementBase;
+  captureAnchor?: {
+    anchoredAtNs: number;
+  };
 };
 type FirstFrameTimecodeResult = {
   timecode: string;
   pts?: number;
   framerate: Rational;
   dropFrame: boolean;
+  advancedFrames: number;
   clockBridge: FirstFrameClockSample;
 };
 type ElementBase = {
