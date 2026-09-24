@@ -58,6 +58,13 @@ Element::Element(const Napi::CallbackInfo &info) :
     [this](const Napi::CallbackInfo &info) -> Napi::Value { return this->add_pad_probe(info); },
     "addPadProbe"
   );
+  auto sample_first_frame_clock_method = Napi::Function::New(
+    env,
+    [this](const Napi::CallbackInfo &info) -> Napi::Value {
+      return this->sample_first_frame_clock(info);
+    },
+    "sampleFirstFrameClock"
+  );
   auto set_pad_method = Napi::Function::New(
     env, [this](const Napi::CallbackInfo &info) -> Napi::Value { return this->set_pad(info); },
     "setPad"
@@ -84,6 +91,9 @@ Element::Element(const Napi::CallbackInfo &info) :
       "setElementProperty", set_element_property_method, napi_enumerable
     ),
     Napi::PropertyDescriptor::Value("addPadProbe", add_pad_probe_method, napi_enumerable),
+    Napi::PropertyDescriptor::Value(
+      "sampleFirstFrameClock", sample_first_frame_clock_method, napi_enumerable
+    ),
     Napi::PropertyDescriptor::Value("setPad", set_pad_method, napi_enumerable),
     Napi::PropertyDescriptor::Value("getPad", get_pad_method, napi_enumerable)
   };
@@ -480,6 +490,211 @@ Napi::Value Element::add_pad_probe(const Napi::CallbackInfo &info) {
 
     return info.Env().Undefined();
   });
+}
+
+// Single-shot sink-pad probe: sample the clock bridge at the first buffer, read
+// together on the streaming thread and delivered to JS via a Promise. Self-removes
+// after one buffer; resolves null on EOS/flush or pad removal before any buffer.
+struct FirstFrameClockContext {
+  std::mutex mutex;
+  GstElement *element = nullptr; // borrowed (owned by the Element/pipeline)
+  // Optional base-time source: read its base_time instead of this element's, so a
+  // frame timestamped by a different pipeline still maps in one domain. Owned:
+  // gst_object_ref'd on register, unref'd in the destroy notify.
+  GstElement *base_time_source = nullptr;
+  bool settled = false; // resolve exactly once
+  Napi::ThreadSafeFunction tsfn;
+};
+
+// Clock-bridge sample carried to the JS resolver. All ns; GST_CLOCK_TIME_NONE
+// marks an unavailable field. captureGstClock = running_time + base_time;
+// (gst_clock, monotonic) is the epoch bridge sampled at the same instant.
+struct FirstFrameClockSample {
+  bool ok = false; // false → resolve with null
+  guint64 running_time = GST_CLOCK_TIME_NONE;
+  guint64 base_time = GST_CLOCK_TIME_NONE;
+  guint64 gst_clock = GST_CLOCK_TIME_NONE;
+  guint64 monotonic = GST_CLOCK_TIME_NONE;
+  bool base_clock_matched = true; // false ⇒ base_time_source on a different clock
+};
+
+// Resolve the Promise once, from the JS thread, then release the TSFN. Idempotent
+// via `settled` — safe from both the probe path and the destroy path.
+static void first_frame_clock_settle(
+  FirstFrameClockContext *ctx, FirstFrameClockSample *sample
+) {
+  {
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    if (ctx->settled) {
+      delete sample;
+      return;
+    }
+    ctx->settled = true;
+  }
+  napi_status status = ctx->tsfn.NonBlockingCall(
+    sample, [](Napi::Env env, Napi::Function jsCallback, FirstFrameClockSample *s) {
+      jsCallback.Call({Napi::External<FirstFrameClockSample>::New(env, s)});
+    }
+  );
+  if (status != napi_ok) {
+    delete sample;
+  }
+  ctx->tsfn.Release();
+}
+
+static GstPadProbeReturn
+first_frame_clock_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+  FirstFrameClockContext *ctx = static_cast<FirstFrameClockContext *>(user_data);
+
+  // EOS/flush before any buffer: no frame will ever arrive, so settle null and
+  // remove the probe. Delivered on the serialized streaming path, unlike the
+  // destroy notify which doesn't fire deterministically on dispose from NULL.
+  if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) {
+    GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
+    if (event && (GST_EVENT_TYPE(event) == GST_EVENT_EOS ||
+                  GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_STOP)) {
+      first_frame_clock_settle(ctx, new FirstFrameClockSample()); // ok=false → null
+      return GST_PAD_PROBE_REMOVE;
+    }
+    return GST_PAD_PROBE_OK;
+  }
+
+  if (!(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER))
+    return GST_PAD_PROBE_OK;
+
+  GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+
+  FirstFrameClockSample *sample = new FirstFrameClockSample();
+  sample->ok = true;
+
+  // running-time = segment-mapped PTS; fall back to the raw PTS (identity segment)
+  // when there is no TIME segment.
+  if (GST_BUFFER_PTS_IS_VALID(buffer)) {
+    GstEvent *seg_event = gst_pad_get_sticky_event(pad, GST_EVENT_SEGMENT, 0);
+    if (seg_event) {
+      const GstSegment *seg = NULL;
+      gst_event_parse_segment(seg_event, &seg);
+      if (seg && seg->format == GST_FORMAT_TIME) {
+        sample->running_time =
+          gst_segment_to_running_time(seg, GST_FORMAT_TIME, GST_BUFFER_PTS(buffer));
+      }
+      gst_event_unref(seg_event);
+    }
+    if (sample->running_time == GST_CLOCK_TIME_NONE)
+      sample->running_time = GST_BUFFER_PTS(buffer);
+  }
+
+  // Read base_time from the supplied source (else this element); the clock always
+  // comes from this element, so the mapping holds only when they share a GstClock.
+  GstElement *base_src = ctx->base_time_source ? ctx->base_time_source : ctx->element;
+  sample->base_time = gst_element_get_base_time(base_src);
+
+  GstClock *clock = gst_element_get_clock(ctx->element);
+  if (clock) {
+    // Read GstClock and CLOCK_MONOTONIC adjacent so their difference is the epoch
+    // offset (steady_clock == CLOCK_MONOTONIC == Node hrtime on Linux).
+    sample->gst_clock = gst_clock_get_time(clock);
+    sample->monotonic = (guint64)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+
+    // Verify the base source shares this clock by object identity — checked, not
+    // assumed, so a base element that later runs on its own clock is caught.
+    if (ctx->base_time_source && ctx->base_time_source != ctx->element) {
+      GstClock *base_clock = gst_element_get_clock(base_src);
+      sample->base_clock_matched = (base_clock == clock);
+      if (base_clock) gst_object_unref(base_clock);
+    }
+
+    gst_object_unref(clock);
+  }
+
+  first_frame_clock_settle(ctx, sample);
+  return GST_PAD_PROBE_REMOVE; // one buffer only
+}
+
+Napi::Value Element::sample_first_frame_clock(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  if (!element.get()) {
+    Napi::TypeError::New(env, "Element is null or not initialized")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  GstPad *sink_pad = gst_element_get_static_pad(element.get(), "sink");
+  if (!sink_pad) {
+    Napi::Error::New(env, "sampleFirstFrameClock: element has no 'sink' pad")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  FirstFrameClockContext *ctx = new FirstFrameClockContext();
+  ctx->element = element.get();
+
+  // Optional base-time source; take an owning ref for the probe's lifetime
+  // (released in the destroy notify).
+  if (info.Length() >= 1 && info[0].IsObject()) {
+    Napi::Object opts = info[0].As<Napi::Object>();
+    if (opts.Has("baseTimeElement") && opts.Get("baseTimeElement").IsObject()) {
+      Napi::Object beObj = opts.Get("baseTimeElement").As<Napi::Object>();
+      Element *beWrap = Napi::ObjectWrap<Element>::Unwrap(beObj);
+      if (beWrap && beWrap->element.get()) {
+        ctx->base_time_source =
+          static_cast<GstElement *>(gst_object_ref(beWrap->element.get()));
+      }
+    }
+  }
+
+  auto deferred = std::make_shared<Napi::Promise::Deferred>(Napi::Promise::Deferred::New(env));
+
+  ctx->tsfn = Napi::ThreadSafeFunction::New(
+    env,
+    Napi::Function::New(
+      env,
+      [deferred](const Napi::CallbackInfo &cbinfo) {
+        Napi::Env env = cbinfo.Env();
+        auto *s = reinterpret_cast<FirstFrameClockSample *>(
+          cbinfo[0].As<Napi::External<FirstFrameClockSample>>().Data()
+        );
+        if (!s || !s->ok) {
+          deferred->Resolve(env.Null());
+        } else {
+          Napi::Object res = Napi::Object::New(env);
+          if (s->running_time != GST_CLOCK_TIME_NONE)
+            res.Set("runningTimeNs", Napi::Number::New(env, static_cast<double>(s->running_time)));
+          if (s->base_time != GST_CLOCK_TIME_NONE)
+            res.Set("baseTimeNs", Napi::Number::New(env, static_cast<double>(s->base_time)));
+          if (s->gst_clock != GST_CLOCK_TIME_NONE)
+            res.Set("gstClockNs", Napi::Number::New(env, static_cast<double>(s->gst_clock)));
+          if (s->monotonic != GST_CLOCK_TIME_NONE)
+            res.Set("monotonicNs", Napi::Number::New(env, static_cast<double>(s->monotonic)));
+          res.Set("baseClockMatched", Napi::Boolean::New(env, s->base_clock_matched));
+          deferred->Resolve(res);
+        }
+        delete s;
+      },
+      "FirstFrameClockResolver"
+    ),
+    "SampleFirstFrameClock", 0, 1
+  );
+
+  gst_pad_add_probe(
+    sink_pad,
+    static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM),
+    first_frame_clock_probe, ctx, [](gpointer data) {
+      // Destroy notify: settle null if the probe was removed before any buffer, so
+      // the Promise never hangs.
+      FirstFrameClockContext *c = static_cast<FirstFrameClockContext *>(data);
+      first_frame_clock_settle(c, new FirstFrameClockSample()); // ok=false → null
+      if (c->base_time_source) gst_object_unref(c->base_time_source);
+      delete c;
+    }
+  );
+  // Drop our pad reference (the probe keeps the pad reachable); an extra ref would
+  // block finalization on dispose, which is what fires the destroy notify above.
+  gst_object_unref(sink_pad);
+
+  return deferred->Promise();
 }
 
 Napi::Value Element::push(const Napi::CallbackInfo &info) {

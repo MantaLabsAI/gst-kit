@@ -120,10 +120,34 @@ export type BufferData = {
   rtp?: RTPData;
 };
 
+export type SampleFirstFrameClockOptions = {
+  // Element whose base_time to report; omit to use this element's own. Pass the
+  // element of the pipeline the running-time is relative to so
+  // runningTimeNs + baseTimeNs stays in one clock domain.
+  baseTimeElement?: ElementBase;
+};
+
+// Clock-bridge sample at the first buffer to cross a sink pad. All ns, absent when
+// unavailable. captureGstClockNs = runningTimeNs + baseTimeNs; (gstClockNs,
+// monotonicNs) bridges to CLOCK_MONOTONIC (Node process.hrtime.bigint on Linux).
+export type FirstFrameClockSample = {
+  runningTimeNs?: number;
+  baseTimeNs?: number;
+  gstClockNs?: number;
+  monotonicNs?: number;
+  // The probe verified baseTimeElement shares this element's GstClock (by object
+  // identity); false ⇒ different clock, baseTimeNs not comparable. True when no
+  // baseTimeElement was passed.
+  baseClockMatched?: boolean;
+};
+
 export type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
   setElementProperty: (key: string, value: GStreamerPropertyValue) => void;
   addPadProbe: (padName: string, callback: (bufferData: BufferData) => void) => () => void;
+  sampleFirstFrameClock: (
+    options?: SampleFirstFrameClockOptions,
+  ) => Promise<FirstFrameClockSample | null>;
   setPad: (attribute: string, padName: string) => void;
   getPad: (padName: string) => GstPad | null;
 };

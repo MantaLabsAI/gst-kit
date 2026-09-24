@@ -78,10 +78,21 @@ type BufferData = {
   };
   rtp?: RTPData;
 };
+type SampleFirstFrameClockOptions = {
+  baseTimeElement?: ElementBase;
+};
+type FirstFrameClockSample = {
+  runningTimeNs?: number;
+  baseTimeNs?: number;
+  gstClockNs?: number;
+  monotonicNs?: number;
+  baseClockMatched?: boolean;
+};
 type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
   setElementProperty: (key: string, value: GStreamerPropertyValue) => void;
   addPadProbe: (padName: string, callback: (bufferData: BufferData) => void) => () => void;
+  sampleFirstFrameClock: (options?: SampleFirstFrameClockOptions) => Promise<FirstFrameClockSample | null>;
   setPad: (attribute: string, padName: string) => void;
   getPad: (padName: string) => GstPad | null;
 };
@@ -158,4 +169,4 @@ declare const _default: {
   GStreamerPropertyReturnValue: GStreamerPropertyReturnValue;
 };
 //#endregion
-export { AppSinkElement, AppSrcElement, BufferData, ElementBase, GStreamerPropertyPrimitiveValue, GStreamerPropertyResult, GStreamerPropertyReturnValue, GStreamerPropertyValue, GStreamerSample, GstBufferFlags, GstMessage, GstPad, PipelineClass as Pipeline, RTPData, StateChangeResult, _default as default };
+export { AppSinkElement, AppSrcElement, BufferData, ElementBase, FirstFrameClockSample, GStreamerPropertyPrimitiveValue, GStreamerPropertyResult, GStreamerPropertyReturnValue, GStreamerPropertyValue, GStreamerSample, GstBufferFlags, GstMessage, GstPad, PipelineClass as Pipeline, RTPData, SampleFirstFrameClockOptions, StateChangeResult, _default as default };
