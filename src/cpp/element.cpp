@@ -524,6 +524,16 @@ struct FirstFrameClockContext {
   guint stamp_fps_n = 0, stamp_fps_d = 1;
   bool stamp_drop = false;
   guint stamp_hh = 0, stamp_mm = 0, stamp_ss = 0, stamp_ff = 0;
+
+  // Optional capture anchor (ARKP-1535): the caller's reference-clock anchor in
+  // the same monotonic domain as the clock bridge's `monotonic` field. When set,
+  // the stamp is advanced from the seed by the frames elapsed between this anchor
+  // and the first frame's capture instant, so the label describes the frame that
+  // was actually captured rather than the request-time seed. The seed
+  // (stamp_hh..ff) must already be the anchor's value expressed at the camera
+  // rate (the caller reconciles it), so the advance is a plain frame add.
+  bool has_capture_anchor = false;
+  guint64 capture_anchor_ns = 0;
 };
 
 // Clock-bridge sample carried to the JS resolver. All ns; GST_CLOCK_TIME_NONE
@@ -543,6 +553,9 @@ struct FirstFrameClockSample {
   guint64 first_pts = GST_CLOCK_TIME_NONE;
   guint applied_fps_n = 0, applied_fps_d = 1;
   bool applied_drop = false;
+  // Frames the seed was advanced by (ARKP-1535 capture-anchor path); 0 when no
+  // anchor was supplied or the advance could not be computed (seed stamped as-is).
+  gint64 advanced_frames = 0;
 };
 
 // Resolve the Promise once, from the JS thread, then release the TSFN. Idempotent
@@ -594,44 +607,9 @@ first_frame_clock_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) 
   FirstFrameClockSample *sample = new FirstFrameClockSample();
   sample->ok = true;
 
-  // Optional first-frame stamp: seed the stamper synchronously here, before it
-  // transforms this buffer. Prefer the negotiated caps rate over the requested one
-  // so the applied label matches what the stamper counts at.
-  if (ctx->has_stamp) {
-    guint use_fps_n = ctx->stamp_fps_n, use_fps_d = ctx->stamp_fps_d;
-    bool use_drop = ctx->stamp_drop;
-    GstCaps *caps = gst_pad_get_current_caps(pad);
-    if (caps) {
-      GstVideoInfo vinfo;
-      gst_video_info_init(&vinfo);
-      if (gst_video_info_from_caps(&vinfo, caps) && GST_VIDEO_INFO_FPS_N(&vinfo) > 0) {
-        use_fps_n = GST_VIDEO_INFO_FPS_N(&vinfo);
-        use_fps_d = GST_VIDEO_INFO_FPS_D(&vinfo);
-      }
-      gst_caps_unref(caps);
-    }
-    GstVideoTimeCodeFlags flags =
-      use_drop ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
-    GstVideoTimeCode *tc = gst_video_time_code_new(
-      use_fps_n, use_fps_d, NULL, flags,
-      ctx->stamp_hh, ctx->stamp_mm, ctx->stamp_ss, ctx->stamp_ff, 0);
-    if (tc) {
-      g_object_set(ctx->element, "set-internal-timecode", tc, NULL);
-      gchar *s = gst_video_time_code_to_string(tc);
-      sample->applied_tc = s ? s : "";
-      if (s) g_free(s);
-      gst_video_time_code_free(tc);
-      sample->stamped = true;
-      sample->applied_fps_n = use_fps_n;
-      sample->applied_fps_d = use_fps_d;
-      sample->applied_drop = use_drop;
-      sample->first_pts =
-        GST_BUFFER_PTS_IS_VALID(buffer) ? GST_BUFFER_PTS(buffer) : GST_CLOCK_TIME_NONE;
-    }
-  }
-
-  // running-time = segment-mapped PTS; fall back to the raw PTS (identity segment)
-  // when there is no TIME segment.
+  // Sample the clock bridge FIRST — the stamp's capture-anchor advance (ARKP-1535)
+  // needs it. running-time = segment-mapped PTS; fall back to the raw PTS
+  // (identity segment) when there is no TIME segment.
   if (GST_BUFFER_PTS_IS_VALID(buffer)) {
     GstEvent *seg_event = gst_pad_get_sticky_event(pad, GST_EVENT_SEGMENT, 0);
     if (seg_event) {
@@ -670,6 +648,74 @@ first_frame_clock_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) 
     }
 
     gst_object_unref(clock);
+  }
+
+  // Optional first-frame stamp: seed the stamper synchronously here, before it
+  // transforms this buffer. Prefer the negotiated caps rate over the requested one
+  // so the applied label matches what the stamper counts at.
+  if (ctx->has_stamp) {
+    guint use_fps_n = ctx->stamp_fps_n, use_fps_d = ctx->stamp_fps_d;
+    bool use_drop = ctx->stamp_drop;
+    GstCaps *caps = gst_pad_get_current_caps(pad);
+    if (caps) {
+      GstVideoInfo vinfo;
+      gst_video_info_init(&vinfo);
+      if (gst_video_info_from_caps(&vinfo, caps) && GST_VIDEO_INFO_FPS_N(&vinfo) > 0) {
+        use_fps_n = GST_VIDEO_INFO_FPS_N(&vinfo);
+        use_fps_d = GST_VIDEO_INFO_FPS_D(&vinfo);
+      }
+      gst_caps_unref(caps);
+    }
+    GstVideoTimeCodeFlags flags =
+      use_drop ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
+    GstVideoTimeCode *tc = gst_video_time_code_new(
+      use_fps_n, use_fps_d, NULL, flags,
+      ctx->stamp_hh, ctx->stamp_mm, ctx->stamp_ss, ctx->stamp_ff, 0);
+    if (tc) {
+      // ARKP-1535: advance the seed to the frame's true capture instant. The seed
+      // is the caller's reference-clock anchor value at the camera rate; the
+      // buffer's capture instant, mapped into the anchor's monotonic domain, is
+      //   captureMonotonic = (running_time + base_time) + (monotonic - gst_clock)
+      // (the same bridge ARK's firstFrameCaptureMonotonicNs computes). The frames
+      // between the anchor and that instant are added with GStreamer's own
+      // drop-frame-correct advance, so burn-in / tmcd / reported label all carry
+      // the captured frame's value, not the request-time seed. Skipped (seed
+      // stamped as-is) when no anchor was supplied, a bridge field is missing, or
+      // the elapsed span is negative — matching today's behaviour on refuse.
+      if (ctx->has_capture_anchor &&
+          sample->running_time != GST_CLOCK_TIME_NONE &&
+          sample->base_time != GST_CLOCK_TIME_NONE &&
+          sample->gst_clock != GST_CLOCK_TIME_NONE &&
+          sample->monotonic != GST_CLOCK_TIME_NONE && use_fps_n > 0) {
+        // All in the monotonic (CLOCK_MONOTONIC) domain, signed so a slightly
+        // early anchor is representable; guard against a negative result.
+        gint64 capture_gst = (gint64)sample->running_time + (gint64)sample->base_time;
+        gint64 gst_to_monotonic = (gint64)sample->monotonic - (gint64)sample->gst_clock;
+        gint64 capture_monotonic = capture_gst + gst_to_monotonic;
+        gint64 elapsed_ns = capture_monotonic - (gint64)ctx->capture_anchor_ns;
+        if (elapsed_ns > 0) {
+          // frames = round(elapsed_ns * fps / 1e9); 64-bit to avoid overflow.
+          gint64 frames =
+            (elapsed_ns * (gint64)use_fps_n + (gint64)use_fps_d * 500000000LL) /
+            ((gint64)use_fps_d * 1000000000LL);
+          if (frames > 0) {
+            gst_video_time_code_add_frames(tc, frames);
+            sample->advanced_frames = frames;
+          }
+        }
+      }
+      g_object_set(ctx->element, "set-internal-timecode", tc, NULL);
+      gchar *s = gst_video_time_code_to_string(tc);
+      sample->applied_tc = s ? s : "";
+      if (s) g_free(s);
+      gst_video_time_code_free(tc);
+      sample->stamped = true;
+      sample->applied_fps_n = use_fps_n;
+      sample->applied_fps_d = use_fps_d;
+      sample->applied_drop = use_drop;
+      sample->first_pts =
+        GST_BUFFER_PTS_IS_VALID(buffer) ? GST_BUFFER_PTS(buffer) : GST_CLOCK_TIME_NONE;
+    }
   }
 
   first_frame_clock_settle(ctx, sample);
@@ -839,6 +885,22 @@ Napi::Value Element::set_first_frame_timecode(const Napi::CallbackInfo &info) {
   GstElement *base = unwrap_base_time_element(opts);
   if (base) ctx->base_time_source = static_cast<GstElement *>(gst_object_ref(base));
 
+  // Optional capture anchor (ARKP-1535): the reference-clock instant, in the same
+  // monotonic domain as the clock bridge, that the seed's value corresponds to.
+  // Present ⇒ advance the seed to the frame's true capture instant at the first
+  // buffer; absent ⇒ stamp the seed verbatim (prior behaviour). The seed must
+  // already be expressed at the camera rate so the advance is a plain frame add.
+  if (opts.Has("captureAnchor") && opts.Get("captureAnchor").IsObject()) {
+    Napi::Object a = opts.Get("captureAnchor").As<Napi::Object>();
+    if (a.Has("anchoredAtNs") && a.Get("anchoredAtNs").IsNumber()) {
+      double anchoredAtNs = a.Get("anchoredAtNs").As<Napi::Number>().DoubleValue();
+      if (anchoredAtNs >= 0) {
+        ctx->has_capture_anchor = true;
+        ctx->capture_anchor_ns = (guint64)anchoredAtNs;
+      }
+    }
+  }
+
   // setFirstFrameTimecode resolves the applied label plus the clock bridge nested.
   return first_frame_register_probe(
     env, element.get(), "setFirstFrameTimecode", ctx,
@@ -852,6 +914,9 @@ Napi::Value Element::set_first_frame_timecode(const Napi::CallbackInfo &info) {
       fr.Set("denominator", Napi::Number::New(env, s->applied_fps_d));
       res.Set("framerate", fr);
       res.Set("dropFrame", Napi::Boolean::New(env, s->applied_drop));
+      // Frames the seed was advanced to reach the capture instant (0 when no
+      // anchor was supplied or the advance was skipped).
+      res.Set("advancedFrames", Napi::Number::New(env, static_cast<double>(s->advanced_frames)));
       res.Set("clockBridge", first_frame_build_clock_bridge(env, s));
       deferred.Resolve(res);
     }
