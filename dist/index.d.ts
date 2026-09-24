@@ -88,11 +88,35 @@ type FirstFrameClockSample = {
   monotonicNs?: number;
   baseClockMatched?: boolean;
 };
+type Rational = {
+  numerator: number;
+  denominator: number;
+};
+type TimecodeValue = {
+  hours: number;
+  minutes: number;
+  seconds: number;
+  frames: number;
+  dropFrame?: boolean;
+};
+type SetFirstFrameTimecodeOptions = {
+  timecode: TimecodeValue;
+  rate?: Rational;
+  baseTimeElement?: ElementBase;
+};
+type FirstFrameTimecodeResult = {
+  timecode: string;
+  pts?: number;
+  framerate: Rational;
+  dropFrame: boolean;
+  clockBridge: FirstFrameClockSample;
+};
 type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
   setElementProperty: (key: string, value: GStreamerPropertyValue) => void;
   addPadProbe: (padName: string, callback: (bufferData: BufferData) => void) => () => void;
   sampleFirstFrameClock: (options?: SampleFirstFrameClockOptions) => Promise<FirstFrameClockSample | null>;
+  setFirstFrameTimecode: (options: SetFirstFrameTimecodeOptions) => Promise<FirstFrameTimecodeResult | null>;
   setPad: (attribute: string, padName: string) => void;
   getPad: (padName: string) => GstPad | null;
 };
@@ -169,4 +193,4 @@ declare const _default: {
   GStreamerPropertyReturnValue: GStreamerPropertyReturnValue;
 };
 //#endregion
-export { AppSinkElement, AppSrcElement, BufferData, ElementBase, FirstFrameClockSample, GStreamerPropertyPrimitiveValue, GStreamerPropertyResult, GStreamerPropertyReturnValue, GStreamerPropertyValue, GStreamerSample, GstBufferFlags, GstMessage, GstPad, PipelineClass as Pipeline, RTPData, SampleFirstFrameClockOptions, StateChangeResult, _default as default };
+export { AppSinkElement, AppSrcElement, BufferData, ElementBase, FirstFrameClockSample, FirstFrameTimecodeResult, GStreamerPropertyPrimitiveValue, GStreamerPropertyResult, GStreamerPropertyReturnValue, GStreamerPropertyValue, GStreamerSample, GstBufferFlags, GstMessage, GstPad, PipelineClass as Pipeline, RTPData, Rational, SampleFirstFrameClockOptions, SetFirstFrameTimecodeOptions, StateChangeResult, TimecodeValue, _default as default };
