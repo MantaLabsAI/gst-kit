@@ -694,9 +694,14 @@ first_frame_clock_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) 
         gint64 capture_monotonic = capture_gst + gst_to_monotonic;
         gint64 elapsed_ns = capture_monotonic - (gint64)ctx->capture_anchor_ns;
         if (elapsed_ns > 0) {
-          // frames = round(elapsed_ns * fps / 1e9); 64-bit to avoid overflow.
+          // frames = floor(elapsed_ns * fps / 1e9); 64-bit to avoid overflow.
+          // Floor (not round) so the label lands on the frame the buffer falls
+          // IN — the same truncate-toward-earlier rule SMPTE advance uses
+          // (ARKP-1497). The anchor is the instant the seed's frame began, so the
+          // elapsed span is a true frame count; rounding could push the label one
+          // frame past the captured buffer.
           gint64 frames =
-            (elapsed_ns * (gint64)use_fps_n + (gint64)use_fps_d * 500000000LL) /
+            (elapsed_ns * (gint64)use_fps_n) /
             ((gint64)use_fps_d * 1000000000LL);
           if (frames > 0) {
             gst_video_time_code_add_frames(tc, frames);
