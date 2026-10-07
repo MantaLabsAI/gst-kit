@@ -3,7 +3,11 @@ node_modules/
 
 # Build outputs
 build/
-dist/
+# dist/ is intentionally committed on this branch so a GitHub-pinned install
+# (github:MantaLabsAI/gst-kit#<commit>) gets the prebuilt JS/types without a
+# TypeScript build step (consumers install without devDeps). Rebuild with
+# `npm run build:ts` and commit the result when the TS source changes.
+# The native addon (*.node) stays ignored — it is rebuilt per platform on install.
 *.node
 *.o
 *.obj
