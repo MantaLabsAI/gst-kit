@@ -74,6 +74,13 @@ Element::Element(const Napi::CallbackInfo &info) :
     },
     "setFirstFrameTimecode"
   );
+  auto attach_sub_frame_overlay_method = Napi::Function::New(
+    env,
+    [this](const Napi::CallbackInfo &info) -> Napi::Value {
+      return this->attach_sub_frame_overlay(info);
+    },
+    "attachSubFrameOverlay"
+  );
   auto set_pad_method = Napi::Function::New(
     env, [this](const Napi::CallbackInfo &info) -> Napi::Value { return this->set_pad(info); },
     "setPad"
@@ -105,6 +112,9 @@ Element::Element(const Napi::CallbackInfo &info) :
     ),
     Napi::PropertyDescriptor::Value(
       "setFirstFrameTimecode", set_first_frame_timecode_method, napi_enumerable
+    ),
+    Napi::PropertyDescriptor::Value(
+      "attachSubFrameOverlay", attach_sub_frame_overlay_method, napi_enumerable
     ),
     Napi::PropertyDescriptor::Value("setPad", set_pad_method, napi_enumerable),
     Napi::PropertyDescriptor::Value("getPad", get_pad_method, napi_enumerable)
@@ -926,6 +936,154 @@ Napi::Value Element::set_first_frame_timecode(const Napi::CallbackInfo &info) {
       deferred.Resolve(res);
     }
   );
+}
+
+// ─── Sub-frame timecode burn-in overlay (ADR-0038) ──────────────────────────
+//
+// A persistent sink-pad buffer probe on a `textoverlay` that, synchronously on
+// the streaming thread, sets the element's `text` property to the source-rate
+// label `HH:MM:SS:FF.n` for each buffer BEFORE that buffer is rendered. Because
+// it runs inline on the streaming thread (no ThreadSafeFunction hop to JS), the
+// text for frame i is set before frame i is drawn — eliminating the up-to-one-
+// frame lag of the JS appsrc/probe feeder it replaces.
+//
+// The label counts at the LTC *source* rate: the seed advances by one source
+// frame every `repeat` video frames (repeat = camera_rate / ltc_rate), and the
+// `.n` suffix (n = frameIndex % repeat) disambiguates the video frames sharing
+// one source label. Frame-exact: the index is a probe-local counter, so it does
+// not depend on PTS or wall-clock timing. The suffix is burn-in pixels only — it
+// never touches the tmcd/tcIn/tcOut (ADR-0035 single-basis holds).
+struct SubFrameOverlayContext {
+  GstElement *element;  // the textoverlay (borrowed; not reffed — see below)
+  // Seed timecode at the source rate.
+  guint seed_hh, seed_mm, seed_ss, seed_ff;
+  gint source_fps_n, source_fps_d;
+  gboolean drop_frame;
+  guint repeat;          // camera_rate / ltc_rate, >= 2
+  guint64 frame_index;   // streaming-thread-local; starts at 0
+};
+
+static GstPadProbeReturn
+sub_frame_overlay_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+  (void)pad;
+  SubFrameOverlayContext *ctx = static_cast<SubFrameOverlayContext *>(user_data);
+  if (!(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER))
+    return GST_PAD_PROBE_OK;
+
+  const guint64 i = ctx->frame_index++;
+  const guint repeat = ctx->repeat > 0 ? ctx->repeat : 1;
+  const guint64 source_frames_elapsed = i / repeat;
+  const guint sub = static_cast<guint>(i % repeat);
+
+  // Build the seed TC at the source rate and advance by the whole source frames
+  // elapsed. GStreamer's add_frames is drop-frame-correct; we force non-drop here
+  // because source-rate takes use integer rates (30/25/24/15), matching the
+  // conductor which strips DF on this path.
+  GstVideoTimeCodeFlags flags =
+    ctx->drop_frame ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
+  GstVideoTimeCode *tc = gst_video_time_code_new(
+    ctx->source_fps_n, ctx->source_fps_d, NULL, flags,
+    ctx->seed_hh, ctx->seed_mm, ctx->seed_ss, ctx->seed_ff, 0);
+  if (tc) {
+    if (source_frames_elapsed > 0)
+      gst_video_time_code_add_frames(tc, (gint64)source_frames_elapsed);
+    gchar *base = gst_video_time_code_to_string(tc);  // HH:MM:SS:FF (or ;FF)
+    if (base) {
+      gchar *text = g_strdup_printf("%s.%u", base, sub);
+      // Set the overlay text for THIS buffer, inline on the streaming thread.
+      g_object_set(ctx->element, "text", text, NULL);
+      g_free(text);
+      g_free(base);
+    }
+    gst_video_time_code_free(tc);
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+Napi::Value Element::attach_sub_frame_overlay(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  if (!element.get()) {
+    Napi::TypeError::New(env, "Element is null or not initialized")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsObject()) {
+    Napi::TypeError::New(env, "attachSubFrameOverlay requires an options object")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object opts = info[0].As<Napi::Object>();
+  if (!opts.Has("timecode") || !opts.Get("timecode").IsObject()) {
+    Napi::TypeError::New(
+      env, "options.timecode { hours, minutes, seconds, frames, dropFrame? } required"
+    ).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object tcObj = opts.Get("timecode").As<Napi::Object>();
+  auto unum = [&](Napi::Object o, const char *k, guint def) -> guint {
+    return (o.Has(k) && o.Get(k).IsNumber()) ? o.Get(k).As<Napi::Number>().Uint32Value() : def;
+  };
+
+  guint repeat = unum(opts, "repeat", 0);
+  if (repeat < 2) {
+    Napi::TypeError::New(env, "attachSubFrameOverlay: options.repeat must be >= 2")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  gint fps_n = 30, fps_d = 1;
+  if (opts.Has("rate") && opts.Get("rate").IsObject()) {
+    Napi::Object r = opts.Get("rate").As<Napi::Object>();
+    fps_n = (gint)unum(r, "numerator", 30);
+    fps_d = (gint)unum(r, "denominator", 1);
+    if (fps_d == 0) fps_d = 1;
+  }
+
+  SubFrameOverlayContext *ctx = new SubFrameOverlayContext();
+  ctx->element = element.get();  // borrowed; the probe is removed before dispose
+  ctx->seed_hh = unum(tcObj, "hours", 0);
+  ctx->seed_mm = unum(tcObj, "minutes", 0);
+  ctx->seed_ss = unum(tcObj, "seconds", 0);
+  ctx->seed_ff = unum(tcObj, "frames", 0);
+  ctx->drop_frame = tcObj.Has("dropFrame") && tcObj.Get("dropFrame").IsBoolean() &&
+                    tcObj.Get("dropFrame").As<Napi::Boolean>().Value();
+  ctx->source_fps_n = fps_n;
+  ctx->source_fps_d = fps_d;
+  ctx->repeat = repeat;
+  ctx->frame_index = 0;
+
+  // textoverlay's video input pad is `video_sink` (basetextoverlay); fall back to
+  // `sink` for a generic element. Probing the video sink puts us inline, in order,
+  // just before the overlay renders each buffer.
+  GstPad *sink_pad = gst_element_get_static_pad(element.get(), "video_sink");
+  if (!sink_pad) sink_pad = gst_element_get_static_pad(element.get(), "sink");
+  if (!sink_pad) {
+    delete ctx;
+    Napi::Error::New(env, "attachSubFrameOverlay: element has no 'video_sink' or 'sink' pad")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  gulong probe_id = gst_pad_add_probe(
+    sink_pad, GST_PAD_PROBE_TYPE_BUFFER, sub_frame_overlay_probe, ctx,
+    [](gpointer data) { delete static_cast<SubFrameOverlayContext *>(data); });
+
+  // Keep a ref for the detach closure; drop our local (the probe keeps the pad
+  // reachable). The detach removes the probe, which fires the destroy notify
+  // that frees ctx.
+  auto *pad_ref = static_cast<GstPad *>(gst_object_ref(sink_pad));
+  gst_object_unref(sink_pad);
+  auto detached = std::make_shared<bool>(false);
+
+  return Napi::Function::New(env, [pad_ref, probe_id, detached](
+                                    const Napi::CallbackInfo &info) -> Napi::Value {
+    if (!*detached) {
+      *detached = true;
+      gst_pad_remove_probe(pad_ref, probe_id);
+      gst_object_unref(pad_ref);
+    }
+    return info.Env().Undefined();
+  });
 }
 
 Napi::Value Element::push(const Napi::CallbackInfo &info) {

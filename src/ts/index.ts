@@ -183,6 +183,19 @@ export type FirstFrameTimecodeResult = {
   clockBridge: FirstFrameClockSample;
 };
 
+export type AttachSubFrameOverlayOptions = {
+  // The source-rate seed label for frame 0 (the LTC label at record start),
+  // expressed at the LTC source rate (`rate`). The probe advances it by one
+  // source frame every `repeat` video frames.
+  timecode: TimecodeValue;
+  // The LTC source frame rate the label counts at (e.g. 30/1). Not the camera
+  // rate. Defaults to 30/1 if omitted.
+  rate?: Rational;
+  // N = camera_rate / ltc_rate — video frames per source label; must be >= 2.
+  // The sub-frame suffix is `frameIndex % repeat` (.0 .. .(repeat-1)).
+  repeat: number;
+};
+
 export type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
   setElementProperty: (key: string, value: GStreamerPropertyValue) => void;
@@ -193,6 +206,11 @@ export type ElementBase = {
   setFirstFrameTimecode: (
     options: SetFirstFrameTimecodeOptions,
   ) => Promise<FirstFrameTimecodeResult | null>;
+  // Attach a persistent sink-pad probe that sets this element's `text` property
+  // to the source-rate sub-frame burn-in label `HH:MM:SS:FF.n` for each buffer,
+  // synchronously on the streaming thread (no frame lag). Call on a `textoverlay`.
+  // Returns a detach function. (ADR-0038 / ARKP-1549.)
+  attachSubFrameOverlay: (options: AttachSubFrameOverlayOptions) => () => void;
   setPad: (attribute: string, padName: string) => void;
   getPad: (padName: string) => GstPad | null;
 };

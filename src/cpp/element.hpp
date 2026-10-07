@@ -19,6 +19,11 @@ public:
   Napi::Value add_pad_probe(const Napi::CallbackInfo &info);
   Napi::Value sample_first_frame_clock(const Napi::CallbackInfo &info);
   Napi::Value set_first_frame_timecode(const Napi::CallbackInfo &info);
+  // Attach a persistent sink-pad buffer probe that, synchronously on the
+  // streaming thread, sets this element's `text` property to the source-rate
+  // sub-frame burn-in label `HH:MM:SS:FF.n` for each buffer before it is
+  // rendered. Zero JS round-trip, so no frame lag. Returns a detach function.
+  Napi::Value attach_sub_frame_overlay(const Napi::CallbackInfo &info);
   // Unwrap an optional { baseTimeElement } JS Element to a borrowed GstElement*,
   // or nullptr when absent/invalid. Static member so it may read the wrapped
   // Element's private handle. The caller takes an owning ref.
