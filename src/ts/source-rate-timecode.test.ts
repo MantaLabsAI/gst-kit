@@ -89,15 +89,16 @@ describe.skipIf(!hasTimecodeStamper)("attachSourceRateTimecode", () => {
       },
     );
     expect(metas.length).toBeGreaterThanOrEqual(4);
-    // The frame field increments once every `repeat` (2) buffers: the first two
-    // share frame 0, the next two frame 1, etc. (monotonic, non-decreasing).
+    // The exact label-repeat invariant (ADR-0038a decision E): buffer i carries
+    // source frame floor(i / repeat), so each distinct source frame appears
+    // exactly `repeat` times. Asserting the exact value (not just monotonic
+    // non-decreasing) catches a bug that advanced every 3rd buffer instead of
+    // every 2nd — which the old monotonic+`0,0` check would have passed (M2).
+    const repeat = 2;
     const frames = metas.map((m) => m.frames);
-    for (let i = 1; i < frames.length; i++) {
-      expect(frames[i]).toBeGreaterThanOrEqual(frames[i - 1]);
-    }
-    // Each distinct frame value appears about `repeat` times.
-    expect(frames[0]).toBe(0);
-    expect(frames[1]).toBe(0);
+    frames.forEach((f, i) => {
+      expect(f).toBe(Math.floor(i / repeat));
+    });
   });
 
   it("carries drop-frame as the NTSC fraction x/1001 (DF-correct, review #2)", async () => {
