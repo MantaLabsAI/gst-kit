@@ -81,6 +81,13 @@ Element::Element(const Napi::CallbackInfo &info) :
     },
     "attachSubFrameOverlay"
   );
+  auto attach_source_rate_timecode_method = Napi::Function::New(
+    env,
+    [this](const Napi::CallbackInfo &info) -> Napi::Value {
+      return this->attach_source_rate_timecode(info);
+    },
+    "attachSourceRateTimecode"
+  );
   auto set_pad_method = Napi::Function::New(
     env, [this](const Napi::CallbackInfo &info) -> Napi::Value { return this->set_pad(info); },
     "setPad"
@@ -115,6 +122,9 @@ Element::Element(const Napi::CallbackInfo &info) :
     ),
     Napi::PropertyDescriptor::Value(
       "attachSubFrameOverlay", attach_sub_frame_overlay_method, napi_enumerable
+    ),
+    Napi::PropertyDescriptor::Value(
+      "attachSourceRateTimecode", attach_source_rate_timecode_method, napi_enumerable
     ),
     Napi::PropertyDescriptor::Value("setPad", set_pad_method, napi_enumerable),
     Napi::PropertyDescriptor::Value("getPad", get_pad_method, napi_enumerable)
@@ -380,6 +390,26 @@ pad_probe_callback(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
         gst_caps_unref(caps);
       }
 
+      // Copy the video timecode meta (GstVideoTimeCodeMeta) if present, so a
+      // caller can observe the frame-field a stamper/author wrote. Copy the
+      // decomposed fields immediately — the meta does not outlive the buffer.
+      bool has_tc = false;
+      guint tc_hh = 0, tc_mm = 0, tc_ss = 0, tc_ff = 0;
+      gint tc_fps_n = 0, tc_fps_d = 1;
+      bool tc_drop = false;
+      GstVideoTimeCodeMeta *tc_meta = gst_buffer_get_video_time_code_meta(buffer);
+      if (tc_meta) {
+        has_tc = true;
+        tc_hh = tc_meta->tc.hours;
+        tc_mm = tc_meta->tc.minutes;
+        tc_ss = tc_meta->tc.seconds;
+        tc_ff = tc_meta->tc.frames;
+        tc_fps_n = (gint)tc_meta->tc.config.fps_n;
+        tc_fps_d = (gint)tc_meta->tc.config.fps_d;
+        tc_drop =
+          (tc_meta->tc.config.flags & GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME) != 0;
+      }
+
       // Copy RTP data if available
       bool has_rtp = false;
       guint32 rtp_timestamp = 0;
@@ -446,6 +476,21 @@ pad_probe_callback(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
           rtpData.Set("payloadType", Napi::Number::New(env, rtp_payload_type));
 
           buffer_data.Set("rtp", rtpData);
+        }
+
+        // Video timecode meta if present (GstVideoTimeCodeMeta).
+        if (has_tc) {
+          Napi::Object tcData = Napi::Object::New(env);
+          tcData.Set("hours", Napi::Number::New(env, tc_hh));
+          tcData.Set("minutes", Napi::Number::New(env, tc_mm));
+          tcData.Set("seconds", Napi::Number::New(env, tc_ss));
+          tcData.Set("frames", Napi::Number::New(env, tc_ff));
+          tcData.Set("dropFrame", Napi::Boolean::New(env, tc_drop));
+          Napi::Object tcRate = Napi::Object::New(env);
+          tcRate.Set("numerator", Napi::Number::New(env, tc_fps_n));
+          tcRate.Set("denominator", Napi::Number::New(env, tc_fps_d));
+          tcData.Set("rate", tcRate);
+          buffer_data.Set("timecodeMeta", tcData);
         }
 
         js_callback.Call({buffer_data});
@@ -1115,6 +1160,169 @@ Napi::Value Element::attach_sub_frame_overlay(const Napi::CallbackInfo &info) {
   // Keep a ref for the detach closure; drop our local (the probe keeps the pad
   // reachable). The detach removes the probe, which fires the destroy notify
   // that frees ctx.
+  auto *pad_ref = static_cast<GstPad *>(gst_object_ref(sink_pad));
+  gst_object_unref(sink_pad);
+  auto detached = std::make_shared<bool>(false);
+
+  return Napi::Function::New(env, [pad_ref, probe_id, detached](
+                                    const Napi::CallbackInfo &info) -> Napi::Value {
+    if (!*detached) {
+      *detached = true;
+      gst_pad_remove_probe(pad_ref, probe_id);
+      gst_object_unref(pad_ref);
+    }
+    return info.Env().Undefined();
+  });
+}
+
+// ─── Source-rate tmcd authoring (ADR-0038a) ─────────────────────────────────
+//
+// A persistent sink-pad buffer probe that, synchronously on the streaming
+// thread, writes a SOURCE-rate `GstVideoTimeCodeMeta` on each buffer via
+// label-repeat: the same source-rate label is carried across the `repeat`
+// (= N = camera_rate / ltc_rate) video frames that map to one LTC frame, then
+// advances one source frame. Placed just before `qtmux
+// force-create-timecode-trak=true`, so the muxed MOV `tmcd` track rolls at the
+// LTC source rate (0–29 for a 30 fps LTC) on a camera-rate (e.g. 60p) video
+// track — exactly the rate-mismatch shape ADR-0037 flagged as the NLE risk.
+//
+// This is a SEPARATE element from the sub-frame overlay (ADR-0038a decision E):
+// the overlay upstream still reads the camera-rate `tc_stamper` meta and divides
+// it to `.n`, while THIS element downstream overwrites the meta with the
+// source-rate label just before the muxer. The two never read each other's
+// meta, so there is no double-divide.
+//
+// Drop-frame correctness is non-negotiable (code review finding #2): the label
+// is built and advanced with GStreamer's own `GstVideoTimeCode` at the
+// fractional LTC rate (e.g. 30000/1001), NOT a hand-built x/1 that is invalid
+// for drop-frame. The caller passes the LTC rate as a rational and the drop-frame
+// flag; GStreamer owns the DF arithmetic end to end.
+//
+// Best-effort / null-safe like the overlay and first-frame anchor: an older
+// gst-kit without this method degrades to a camera-rate `tmcd`, never a broken
+// pipeline (the server's SubFrameOverlayFeeder/author checks for the method).
+struct SourceRateTimecodeContext {
+  gint source_fps_n, source_fps_d; // LTC source rational (e.g. 30000/1001)
+  gboolean drop_frame;
+  guint seed_hh, seed_mm, seed_ss, seed_ff; // the source-rate frame-0 label
+  guint repeat;                             // N = camera_rate / ltc_rate, >= 1
+  guint64 frame_index;                      // streaming-thread-local; starts at 0
+};
+
+static GstPadProbeReturn
+source_rate_timecode_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+  (void)pad;
+  SourceRateTimecodeContext *ctx = static_cast<SourceRateTimecodeContext *>(user_data);
+  if (!(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER))
+    return GST_PAD_PROBE_OK;
+
+  GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+  if (!buffer)
+    return GST_PAD_PROBE_OK;
+
+  const guint repeat = ctx->repeat > 0 ? ctx->repeat : 1;
+  const guint64 i = ctx->frame_index++;
+  // Label-repeat: the same source label spans `repeat` video frames, then the
+  // source frame advances. floor(i / repeat) source frames have elapsed by
+  // buffer i, so the source label at buffer i is seed + floor(i / repeat).
+  const guint64 source_frames_elapsed = i / repeat;
+
+  // Build the source-rate label with GStreamer's own representation so the
+  // drop-frame arithmetic (NTSC x/1001) is correct — never a hand-built x/1.
+  GstVideoTimeCodeFlags flags =
+    ctx->drop_frame ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
+  GstVideoTimeCode *tc = gst_video_time_code_new(
+    ctx->source_fps_n, ctx->source_fps_d, NULL, flags,
+    ctx->seed_hh, ctx->seed_mm, ctx->seed_ss, ctx->seed_ff, 0);
+  if (!tc)
+    return GST_PAD_PROBE_OK; // invalid TC (e.g. DF at a non-x/1001 rate) → leave buffer untouched
+  if (source_frames_elapsed > 0)
+    gst_video_time_code_add_frames(tc, (gint64)source_frames_elapsed);
+
+  // Overwrite (or add) the buffer's timecode meta with the source-rate label.
+  // The buffer must be writable to carry a fresh meta; the probe owns the buffer
+  // on the streaming thread, so make it writable in place.
+  GstBuffer *writable = gst_buffer_make_writable(buffer);
+  if (writable) {
+    GST_PAD_PROBE_INFO_DATA(info) = writable;
+    buffer = writable;
+    // Drop any upstream (camera-rate) timecode meta so qtmux boxes only ours.
+    GstVideoTimeCodeMeta *existing = gst_buffer_get_video_time_code_meta(buffer);
+    if (existing)
+      gst_buffer_remove_meta(buffer, (GstMeta *)existing);
+    gst_buffer_add_video_time_code_meta(buffer, tc);
+  }
+  gst_video_time_code_free(tc);
+  return GST_PAD_PROBE_OK;
+}
+
+Napi::Value Element::attach_source_rate_timecode(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  if (!element.get()) {
+    Napi::TypeError::New(env, "Element is null or not initialized")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsObject()) {
+    Napi::TypeError::New(env, "attachSourceRateTimecode requires an options object")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object opts = info[0].As<Napi::Object>();
+  if (!opts.Has("timecode") || !opts.Get("timecode").IsObject()) {
+    Napi::TypeError::New(
+      env, "options.timecode { hours, minutes, seconds, frames, dropFrame? } required"
+    ).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object tcObj = opts.Get("timecode").As<Napi::Object>();
+  auto unum = [&](Napi::Object o, const char *k, guint def) -> guint {
+    return (o.Has(k) && o.Get(k).IsNumber()) ? o.Get(k).As<Napi::Number>().Uint32Value() : def;
+  };
+
+  guint repeat = unum(opts, "repeat", 0);
+  if (repeat < 1) {
+    Napi::TypeError::New(env, "attachSourceRateTimecode: options.repeat must be >= 1")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  gint fps_n = 30, fps_d = 1;
+  if (opts.Has("rate") && opts.Get("rate").IsObject()) {
+    Napi::Object r = opts.Get("rate").As<Napi::Object>();
+    fps_n = (gint)unum(r, "numerator", 30);
+    fps_d = (gint)unum(r, "denominator", 1);
+    if (fps_d == 0) fps_d = 1;
+  }
+
+  SourceRateTimecodeContext *ctx = new SourceRateTimecodeContext();
+  ctx->source_fps_n = fps_n;
+  ctx->source_fps_d = fps_d;
+  ctx->drop_frame = tcObj.Has("dropFrame") && tcObj.Get("dropFrame").IsBoolean() &&
+                    tcObj.Get("dropFrame").As<Napi::Boolean>().Value();
+  ctx->seed_hh = unum(tcObj, "hours", 0);
+  ctx->seed_mm = unum(tcObj, "minutes", 0);
+  ctx->seed_ss = unum(tcObj, "seconds", 0);
+  ctx->seed_ff = unum(tcObj, "frames", 0);
+  ctx->repeat = repeat;
+  ctx->frame_index = 0;
+
+  // The authoring element is a passthrough (e.g. `identity`) carrying a single
+  // `sink` pad. Probe the sink pad so the meta is written on the buffer BEFORE it
+  // reaches `qtmux` downstream.
+  GstPad *sink_pad = gst_element_get_static_pad(element.get(), "sink");
+  if (!sink_pad) sink_pad = gst_element_get_static_pad(element.get(), "video_sink");
+  if (!sink_pad) {
+    delete ctx;
+    Napi::Error::New(env, "attachSourceRateTimecode: element has no 'sink' or 'video_sink' pad")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  gulong probe_id = gst_pad_add_probe(
+    sink_pad, GST_PAD_PROBE_TYPE_BUFFER, source_rate_timecode_probe, ctx,
+    [](gpointer data) { delete static_cast<SourceRateTimecodeContext *>(data); });
+
   auto *pad_ref = static_cast<GstPad *>(gst_object_ref(sink_pad));
   gst_object_unref(sink_pad);
   auto detached = std::make_shared<bool>(false);

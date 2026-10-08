@@ -24,6 +24,15 @@ public:
   // sub-frame burn-in label `HH:MM:SS:FF.n` for each buffer before it is
   // rendered. Zero JS round-trip, so no frame lag. Returns a detach function.
   Napi::Value attach_sub_frame_overlay(const Napi::CallbackInfo &info);
+  // Attach a persistent sink-pad buffer probe that, synchronously on the
+  // streaming thread, authors a SOURCE-rate GstVideoTimeCodeMeta on each buffer
+  // via label-repeat: the same source-rate label is carried across the N video
+  // frames that map to one LTC frame (advance one source frame every `repeat`
+  // buffers). Drop-frame-correct via GstVideoTimeCode. Placed just before
+  // `qtmux force-create-timecode-trak` so the muxed `tmcd` track rolls at the
+  // LTC source rate on a camera-rate video track. Returns a detach function.
+  // (ADR-0038a / ARKP-1549.)
+  Napi::Value attach_source_rate_timecode(const Napi::CallbackInfo &info);
   // Unwrap an optional { baseTimeElement } JS Element to a borrowed GstElement*,
   // or nullptr when absent/invalid. Static member so it may read the wrapped
   // Element's private handle. The caller takes an owning ref.

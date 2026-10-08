@@ -77,6 +77,14 @@ type BufferData = {
     [key: string]: GStreamerPropertyValue | undefined;
   };
   rtp?: RTPData;
+  timecodeMeta?: {
+    hours: number;
+    minutes: number;
+    seconds: number;
+    frames: number;
+    dropFrame: boolean;
+    rate: Rational;
+  };
 };
 type SampleFirstFrameClockOptions = {
   baseTimeElement?: ElementBase;
@@ -120,6 +128,11 @@ type AttachSubFrameOverlayOptions = {
   rate?: Rational;
   repeat: number;
 };
+type AttachSourceRateTimecodeOptions = {
+  timecode: TimecodeValue;
+  rate?: Rational;
+  repeat: number;
+};
 type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
   setElementProperty: (key: string, value: GStreamerPropertyValue) => void;
@@ -127,6 +140,7 @@ type ElementBase = {
   sampleFirstFrameClock: (options?: SampleFirstFrameClockOptions) => Promise<FirstFrameClockSample | null>;
   setFirstFrameTimecode: (options: SetFirstFrameTimecodeOptions) => Promise<FirstFrameTimecodeResult | null>;
   attachSubFrameOverlay: (options: AttachSubFrameOverlayOptions) => () => void;
+  attachSourceRateTimecode: (options: AttachSourceRateTimecodeOptions) => () => void;
   setPad: (attribute: string, padName: string) => void;
   getPad: (padName: string) => GstPad | null;
 };
@@ -203,4 +217,4 @@ declare const _default: {
   GStreamerPropertyReturnValue: GStreamerPropertyReturnValue;
 };
 //#endregion
-export { AppSinkElement, AppSrcElement, AttachSubFrameOverlayOptions, BufferData, ElementBase, FirstFrameClockSample, FirstFrameTimecodeResult, GStreamerPropertyPrimitiveValue, GStreamerPropertyResult, GStreamerPropertyReturnValue, GStreamerPropertyValue, GStreamerSample, GstBufferFlags, GstMessage, GstPad, PipelineClass as Pipeline, RTPData, Rational, SampleFirstFrameClockOptions, SetFirstFrameTimecodeOptions, StateChangeResult, TimecodeValue, _default as default };
+export { AppSinkElement, AppSrcElement, AttachSourceRateTimecodeOptions, AttachSubFrameOverlayOptions, BufferData, ElementBase, FirstFrameClockSample, FirstFrameTimecodeResult, GStreamerPropertyPrimitiveValue, GStreamerPropertyResult, GStreamerPropertyReturnValue, GStreamerPropertyValue, GStreamerSample, GstBufferFlags, GstMessage, GstPad, PipelineClass as Pipeline, RTPData, Rational, SampleFirstFrameClockOptions, SetFirstFrameTimecodeOptions, StateChangeResult, TimecodeValue, _default as default };
