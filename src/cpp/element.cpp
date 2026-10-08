@@ -947,21 +947,50 @@ Napi::Value Element::set_first_frame_timecode(const Napi::CallbackInfo &info) {
 // text for frame i is set before frame i is drawn — eliminating the up-to-one-
 // frame lag of the JS appsrc/probe feeder it replaces.
 //
-// The label counts at the LTC *source* rate: the seed advances by one source
-// frame every `repeat` video frames (repeat = camera_rate / ltc_rate), and the
-// `.n` suffix (n = frameIndex % repeat) disambiguates the video frames sharing
-// one source label. Frame-exact: the index is a probe-local counter, so it does
-// not depend on PTS or wall-clock timing. The suffix is burn-in pixels only — it
-// never touches the tmcd/tcIn/tcOut (ADR-0035 single-basis holds).
+// The label counts at the LTC *source* rate. The source of truth is the buffer's
+// own `GstVideoTimeCodeMeta`, which `tc_stamper` attaches upstream: it is the
+// camera-rate whole-frame timecode, already advanced to the frame's true capture
+// instant (ARKP-1535) and already drop-frame-correct for the camera rate. The
+// burn-in is derived FROM that meta so it shares one basis with the tmcd/tcIn
+// (ADR-0035): with repeat = camera_rate / ltc_rate, the camera-rate frame field
+// `cameraFF` maps to the source label `floor(cameraFF / repeat)` and the sub-frame
+// suffix `cameraFF % repeat`. HH:MM:SS and the drop-frame separator are taken
+// straight from the meta, so a 29.97 DF camera is handled by GStreamer's own
+// representation rather than a hand-built TC that would be rejected at x/1 (the
+// freeze Brigido's repro hit). Reading the meta also fixes the first-frame phase:
+// the overlay no longer counts from the unadvanced request-time seed.
+//
+// Fallback: when no meta is present (e.g. an older pipeline without the stamper
+// on this branch), the probe counts from the seed with a local frame index. This
+// is the pre-ARKP-1549-review behaviour and keeps the burn-in rendering rather
+// than going blank.
 struct SubFrameOverlayContext {
   GstElement *element;  // the textoverlay (borrowed; not reffed — see below)
-  // Seed timecode at the source rate.
+  // Seed timecode at the source rate — fallback only, when no meta is present.
   guint seed_hh, seed_mm, seed_ss, seed_ff;
   gint source_fps_n, source_fps_d;
   gboolean drop_frame;
   guint repeat;          // camera_rate / ltc_rate, >= 2
-  guint64 frame_index;   // streaming-thread-local; starts at 0
+  guint64 frame_index;   // streaming-thread-local; starts at 0 (fallback path)
 };
+
+// Derive and set the source-rate burn-in label from a camera-rate whole-frame
+// timecode (the stamper's meta). `camera_ff` is divided down to the source label
+// and the remainder becomes the `.n` sub-frame suffix.
+static void
+set_subframe_text_from_camera_tc(GstElement *element, guint hh, guint mm, guint ss,
+                                 guint camera_ff, gboolean drop_frame, guint repeat) {
+  const guint r = repeat > 0 ? repeat : 1;
+  const guint source_ff = camera_ff / r;
+  const guint sub = camera_ff % r;
+  // Match GstVideoTimeCode's own text form: ';' before the frame field for
+  // drop-frame, ':' otherwise.
+  const char sep = drop_frame ? ';' : ':';
+  gchar *text =
+    g_strdup_printf("%02u:%02u:%02u%c%02u.%u", hh, mm, ss, sep, source_ff, sub);
+  g_object_set(element, "text", text, NULL);
+  g_free(text);
+}
 
 static GstPadProbeReturn
 sub_frame_overlay_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
@@ -970,15 +999,30 @@ sub_frame_overlay_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) 
   if (!(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER))
     return GST_PAD_PROBE_OK;
 
-  const guint64 i = ctx->frame_index++;
   const guint repeat = ctx->repeat > 0 ? ctx->repeat : 1;
+
+  // Preferred path: read the stamper's camera-rate timecode meta off this buffer
+  // and divide it down to the source label. One basis with the tmcd, correct
+  // first-frame phase, and GStreamer owns the drop-frame arithmetic.
+  GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+  if (buffer) {
+    GstVideoTimeCodeMeta *meta = gst_buffer_get_video_time_code_meta(buffer);
+    if (meta) {
+      const GstVideoTimeCode *tc = &meta->tc;
+      const gboolean df =
+        (tc->config.flags & GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME) != 0;
+      set_subframe_text_from_camera_tc(ctx->element, tc->hours, tc->minutes,
+                                       tc->seconds, tc->frames, df, repeat);
+      return GST_PAD_PROBE_OK;
+    }
+  }
+
+  // Fallback: no meta on the buffer. Count from the seed with a local index.
+  // GStreamer's add_frames is drop-frame-correct; we force non-drop here because
+  // source-rate takes use integer rates (30/25/24/15) on this fallback path.
+  const guint64 i = ctx->frame_index++;
   const guint64 source_frames_elapsed = i / repeat;
   const guint sub = static_cast<guint>(i % repeat);
-
-  // Build the seed TC at the source rate and advance by the whole source frames
-  // elapsed. GStreamer's add_frames is drop-frame-correct; we force non-drop here
-  // because source-rate takes use integer rates (30/25/24/15), matching the
-  // conductor which strips DF on this path.
   GstVideoTimeCodeFlags flags =
     ctx->drop_frame ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
   GstVideoTimeCode *tc = gst_video_time_code_new(
