@@ -118,6 +118,17 @@ export type BufferData = {
 
   // RTP-specific data (only present for RTP streams)
   rtp?: RTPData;
+
+  // Video timecode meta (GstVideoTimeCodeMeta) decomposed, when the buffer
+  // carries one (e.g. authored by timecodestamper or attachSourceRateTimecode).
+  timecodeMeta?: {
+    hours: number;
+    minutes: number;
+    seconds: number;
+    frames: number;
+    dropFrame: boolean;
+    rate: Rational;
+  };
 };
 
 export type SampleFirstFrameClockOptions = {
@@ -196,6 +207,20 @@ export type AttachSubFrameOverlayOptions = {
   repeat: number;
 };
 
+export type AttachSourceRateTimecodeOptions = {
+  // The source-rate seed label for frame 0 (the LTC label at record start),
+  // expressed at the LTC source rate (`rate`). The probe carries it across
+  // `repeat` video frames, then advances one source frame.
+  timecode: TimecodeValue;
+  // The LTC source frame rate the authored tmcd counts at, as a rational. Pass
+  // the NTSC fraction (e.g. 30000/1001) for a drop-frame source — a hand-built
+  // x/1 is invalid for drop-frame. Defaults to 30/1 if omitted.
+  rate?: Rational;
+  // N = camera_rate / ltc_rate — video frames per source label; must be >= 1
+  // (1 is a no-op repeat, i.e. the source rate equals the camera rate).
+  repeat: number;
+};
+
 export type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
   setElementProperty: (key: string, value: GStreamerPropertyValue) => void;
@@ -211,6 +236,14 @@ export type ElementBase = {
   // synchronously on the streaming thread (no frame lag). Call on a `textoverlay`.
   // Returns a detach function. (ADR-0038 / ARKP-1549.)
   attachSubFrameOverlay: (options: AttachSubFrameOverlayOptions) => () => void;
+  // Attach a persistent sink-pad probe that writes a SOURCE-rate
+  // GstVideoTimeCodeMeta on each buffer via label-repeat (the same source label
+  // across `repeat` video frames), synchronously on the streaming thread, so a
+  // downstream `qtmux force-create-timecode-trak` boxes a source-rate `tmcd`
+  // track on a camera-rate video track. Drop-frame-correct via GstVideoTimeCode.
+  // Call on a passthrough element (e.g. `identity`) just before the muxer.
+  // Returns a detach function. (ADR-0038a / ARKP-1549.)
+  attachSourceRateTimecode: (options: AttachSourceRateTimecodeOptions) => () => void;
   setPad: (attribute: string, padName: string) => void;
   getPad: (padName: string) => GstPad | null;
 };
