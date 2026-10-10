@@ -2,7 +2,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 //#region src/ts/index.ts
-const projectRoot = join(dirname(fileURLToPath(import.meta.url)), "../../");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const projectRoot = join(__dirname, "../../");
 const nativeAddon = createRequire(import.meta.url)(join(projectRoot, "build/Release/gst_kit.node"));
 /**
 * https://gstreamer.freedesktop.org/documentation/gstreamer/gstbuffer.html?gi-language=c#GstBufferFlags

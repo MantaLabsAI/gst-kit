@@ -221,6 +221,19 @@ export type AttachSourceRateTimecodeOptions = {
   repeat: number;
 };
 
+export type AttachCameraRateTimecodeOptions = {
+  // The camera-rate frame-0 seed label, used only as a fallback for buffers that
+  // reach the author with an absent or all-zero meta before any valid upstream
+  // (stamper) meta has been seen. When a valid meta is present it is kept and
+  // reused, so the authored tmcd matches the burn-in / tcIn exactly.
+  timecode: TimecodeValue;
+  // The camera frame rate the tmcd counts at, as a rational. Pass the NTSC
+  // fraction (e.g. 60000/1001) for a drop-frame camera — a hand-built x/1 is
+  // invalid for drop-frame. Defaults to 30/1 if omitted. No `repeat`: one frame
+  // per buffer at the camera rate.
+  rate?: Rational;
+};
+
 export type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
   setElementProperty: (key: string, value: GStreamerPropertyValue) => void;
@@ -244,6 +257,15 @@ export type ElementBase = {
   // Call on a passthrough element (e.g. `identity`) just before the muxer.
   // Returns a detach function. (ADR-0038a / ARKP-1549.)
   attachSourceRateTimecode: (options: AttachSourceRateTimecodeOptions) => () => void;
+  // Attach a persistent sink-pad probe that GUARANTEES every buffer carries a
+  // valid camera-rate GstVideoTimeCodeMeta before a downstream `qtmux
+  // force-create-timecode-trak` boxes it. It keeps the upstream stamper meta
+  // when present (so the authored tmcd matches the burn-in / tcIn), and fills
+  // only buffers whose meta is absent or all-zero from the last-good label (or
+  // the seed, until one has been seen) — closing the camera-rate audio-ON defect
+  // where qtmux boxes a default `tmcd=00:00:00:00`. Call on a passthrough element
+  // (e.g. `identity`) just before the muxer. Returns a detach function.
+  attachCameraRateTimecode: (options: AttachCameraRateTimecodeOptions) => () => void;
   setPad: (attribute: string, padName: string) => void;
   getPad: (padName: string) => GstPad | null;
 };

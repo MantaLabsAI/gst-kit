@@ -33,6 +33,20 @@ public:
   // LTC source rate on a camera-rate video track. Returns a detach function.
   // (ADR-0038a / ARKP-1549.)
   Napi::Value attach_source_rate_timecode(const Napi::CallbackInfo &info);
+  // Attach a persistent sink-pad buffer probe that, synchronously on the
+  // streaming thread, GUARANTEES every buffer carries a valid camera-rate
+  // GstVideoTimeCodeMeta before it reaches a downstream `qtmux
+  // force-create-timecode-trak`. Unlike attach_source_rate_timecode this is a
+  // hold-last-good + seed-fallback re-assert: a buffer that already carries a
+  // valid (present, non-all-zero) meta is left untouched and cached as the
+  // last-good; a buffer with an absent or all-zero meta is overwritten with the
+  // last-good (or, until a good meta has been seen, with the configured seed).
+  // This closes the camera-rate audio-ON defect where qtmux boxes a default
+  // `tmcd=00:00:00:00` because the first boxed buffer reaches the muxer with no
+  // meta, WITHOUT advancing frame 0 off the stamper's own label (so it cannot
+  // drift from the burn-in / tcIn). One frame per buffer = camera rate; no
+  // `repeat`. Returns a detach function.
+  Napi::Value attach_camera_rate_timecode(const Napi::CallbackInfo &info);
   // Unwrap an optional { baseTimeElement } JS Element to a borrowed GstElement*,
   // or nullptr when absent/invalid. Static member so it may read the wrapped
   // Element's private handle. The caller takes an owning ref.

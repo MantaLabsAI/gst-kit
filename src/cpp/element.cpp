@@ -88,6 +88,13 @@ Element::Element(const Napi::CallbackInfo &info) :
     },
     "attachSourceRateTimecode"
   );
+  auto attach_camera_rate_timecode_method = Napi::Function::New(
+    env,
+    [this](const Napi::CallbackInfo &info) -> Napi::Value {
+      return this->attach_camera_rate_timecode(info);
+    },
+    "attachCameraRateTimecode"
+  );
   auto set_pad_method = Napi::Function::New(
     env, [this](const Napi::CallbackInfo &info) -> Napi::Value { return this->set_pad(info); },
     "setPad"
@@ -125,6 +132,9 @@ Element::Element(const Napi::CallbackInfo &info) :
     ),
     Napi::PropertyDescriptor::Value(
       "attachSourceRateTimecode", attach_source_rate_timecode_method, napi_enumerable
+    ),
+    Napi::PropertyDescriptor::Value(
+      "attachCameraRateTimecode", attach_camera_rate_timecode_method, napi_enumerable
     ),
     Napi::PropertyDescriptor::Value("setPad", set_pad_method, napi_enumerable),
     Napi::PropertyDescriptor::Value("getPad", get_pad_method, napi_enumerable)
@@ -1322,6 +1332,154 @@ Napi::Value Element::attach_source_rate_timecode(const Napi::CallbackInfo &info)
   gulong probe_id = gst_pad_add_probe(
     sink_pad, GST_PAD_PROBE_TYPE_BUFFER, source_rate_timecode_probe, ctx,
     [](gpointer data) { delete static_cast<SourceRateTimecodeContext *>(data); });
+
+  auto *pad_ref = static_cast<GstPad *>(gst_object_ref(sink_pad));
+  gst_object_unref(sink_pad);
+  auto detached = std::make_shared<bool>(false);
+
+  return Napi::Function::New(env, [pad_ref, probe_id, detached](
+                                    const Napi::CallbackInfo &info) -> Napi::Value {
+    if (!*detached) {
+      *detached = true;
+      gst_pad_remove_probe(pad_ref, probe_id);
+      gst_object_unref(pad_ref);
+    }
+    return info.Env().Undefined();
+  });
+}
+
+// hold-last-good + seed-fallback re-assert of a CAMERA-rate timecode
+// meta. Unlike the source-rate author it does NOT relabel buffers that already
+// carry a valid meta (so it reuses the stamper's own frame-0 label and cannot
+// drift from the burn-in / tcIn); it only fills buffers whose meta is absent or
+// all-zero so a downstream qtmux cannot box a default `tmcd=00:00:00:00`.
+struct CameraRateTimecodeContext {
+  gint fps_n, fps_d; // camera rational (e.g. 60/1 or 60000/1001)
+  gboolean drop_frame;
+  guint seed_hh, seed_mm, seed_ss, seed_ff; // camera-rate frame-0 seed fallback
+  gboolean have_last_good;                   // a valid upstream meta has been seen
+  guint last_hh, last_mm, last_ss, last_ff;  // cached last-good label
+};
+
+// A meta is "valid" when it is present and not all-zero (HH|MM|SS|FF != 0). An
+// all-zero label is the exact default qtmux boxes when no real meta arrives, so
+// we treat it as "needs filling" rather than trust it.
+static gboolean camera_rate_meta_is_valid(const GstVideoTimeCodeMeta *meta) {
+  if (!meta)
+    return FALSE;
+  return (meta->tc.hours | meta->tc.minutes | meta->tc.seconds | meta->tc.frames) != 0;
+}
+
+static GstPadProbeReturn
+camera_rate_timecode_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+  (void)pad;
+  CameraRateTimecodeContext *ctx = static_cast<CameraRateTimecodeContext *>(user_data);
+  if (!(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER))
+    return GST_PAD_PROBE_OK;
+
+  GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+  if (!buffer)
+    return GST_PAD_PROBE_OK;
+
+  GstVideoTimeCodeMeta *existing = gst_buffer_get_video_time_code_meta(buffer);
+  if (camera_rate_meta_is_valid(existing)) {
+    // Hold-last-good: cache the stamper's own label and leave the buffer alone,
+    // so a correct meta is never relabelled (no drift from burn-in / tcIn).
+    ctx->have_last_good = TRUE;
+    ctx->last_hh = existing->tc.hours;
+    ctx->last_mm = existing->tc.minutes;
+    ctx->last_ss = existing->tc.seconds;
+    ctx->last_ff = existing->tc.frames;
+    return GST_PAD_PROBE_OK;
+  }
+
+  // Absent or all-zero: re-assert from last-good, else from the seed.
+  const guint hh = ctx->have_last_good ? ctx->last_hh : ctx->seed_hh;
+  const guint mm = ctx->have_last_good ? ctx->last_mm : ctx->seed_mm;
+  const guint ss = ctx->have_last_good ? ctx->last_ss : ctx->seed_ss;
+  const guint ff = ctx->have_last_good ? ctx->last_ff : ctx->seed_ff;
+
+  GstVideoTimeCodeFlags flags =
+    ctx->drop_frame ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
+  GstVideoTimeCode *tc =
+    gst_video_time_code_new(ctx->fps_n, ctx->fps_d, NULL, flags, hh, mm, ss, ff, 0);
+  if (!tc)
+    return GST_PAD_PROBE_OK; // invalid TC (e.g. DF at a non-x/1001 rate) → leave buffer untouched
+
+  GstBuffer *writable = gst_buffer_make_writable(buffer);
+  if (writable) {
+    GST_PAD_PROBE_INFO_DATA(info) = writable;
+    buffer = writable;
+    // Drop any absent/zero meta that was there so qtmux boxes only ours.
+    GstVideoTimeCodeMeta *stale = gst_buffer_get_video_time_code_meta(buffer);
+    if (stale)
+      gst_buffer_remove_meta(buffer, (GstMeta *)stale);
+    gst_buffer_add_video_time_code_meta(buffer, tc);
+  }
+  gst_video_time_code_free(tc);
+  return GST_PAD_PROBE_OK;
+}
+
+Napi::Value Element::attach_camera_rate_timecode(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  if (!element.get()) {
+    Napi::TypeError::New(env, "Element is null or not initialized")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsObject()) {
+    Napi::TypeError::New(env, "attachCameraRateTimecode requires an options object")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object opts = info[0].As<Napi::Object>();
+  if (!opts.Has("timecode") || !opts.Get("timecode").IsObject()) {
+    Napi::TypeError::New(
+      env, "options.timecode { hours, minutes, seconds, frames, dropFrame? } required"
+    ).ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object tcObj = opts.Get("timecode").As<Napi::Object>();
+  auto unum = [&](Napi::Object o, const char *k, guint def) -> guint {
+    return (o.Has(k) && o.Get(k).IsNumber()) ? o.Get(k).As<Napi::Number>().Uint32Value() : def;
+  };
+
+  gint fps_n = 30, fps_d = 1;
+  if (opts.Has("rate") && opts.Get("rate").IsObject()) {
+    Napi::Object r = opts.Get("rate").As<Napi::Object>();
+    fps_n = (gint)unum(r, "numerator", 30);
+    fps_d = (gint)unum(r, "denominator", 1);
+    if (fps_d == 0) fps_d = 1;
+  }
+
+  CameraRateTimecodeContext *ctx = new CameraRateTimecodeContext();
+  ctx->fps_n = fps_n;
+  ctx->fps_d = fps_d;
+  ctx->drop_frame = tcObj.Has("dropFrame") && tcObj.Get("dropFrame").IsBoolean() &&
+                    tcObj.Get("dropFrame").As<Napi::Boolean>().Value();
+  ctx->seed_hh = unum(tcObj, "hours", 0);
+  ctx->seed_mm = unum(tcObj, "minutes", 0);
+  ctx->seed_ss = unum(tcObj, "seconds", 0);
+  ctx->seed_ff = unum(tcObj, "frames", 0);
+  ctx->have_last_good = FALSE;
+  ctx->last_hh = ctx->last_mm = ctx->last_ss = ctx->last_ff = 0;
+
+  // The authoring element is a passthrough (e.g. `identity`) carrying a single
+  // `sink` pad. Probe the sink pad so the meta is re-asserted on the buffer
+  // BEFORE it reaches `qtmux` downstream (same pad resolution as the
+  // source-rate probe).
+  GstPad *sink_pad = gst_element_get_static_pad(element.get(), "sink");
+  if (!sink_pad) sink_pad = gst_element_get_static_pad(element.get(), "video_sink");
+  if (!sink_pad) {
+    delete ctx;
+    Napi::Error::New(env, "attachCameraRateTimecode: element has no 'sink' or 'video_sink' pad")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  gulong probe_id = gst_pad_add_probe(
+    sink_pad, GST_PAD_PROBE_TYPE_BUFFER, camera_rate_timecode_probe, ctx,
+    [](gpointer data) { delete static_cast<CameraRateTimecodeContext *>(data); });
 
   auto *pad_ref = static_cast<GstPad *>(gst_object_ref(sink_pad));
   gst_object_unref(sink_pad);
