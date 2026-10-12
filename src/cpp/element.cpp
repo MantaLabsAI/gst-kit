@@ -1386,9 +1386,30 @@ struct AudioDropGateContext {
   // subsequent audio buffers pass without a running-time check (requirement 3).
   std::atomic<bool> gate_open{false};
   // Count of leading audio buffers dropped, for the audio-drop-gate marker.
+  // Only ever mutated on the audio streaming thread (the one place drops happen
+  // and the one place the open-latch logs it), so the relaxed load at the log
+  // site below is exact. If drops ever move off that thread, bump to acquire.
   std::atomic<guint64> dropped{0};
   std::atomic<bool> logged_open{false};
+  // Fail-open safety (code review M1): count audio buffers dropped WHILE the
+  // video origin is still unknown. If the video branch never delivers a buffer
+  // that carries a running-time (startup stall, source dropout), an unbounded
+  // "origin unknown" drop would silently discard the whole take's audio and
+  // starve the AAC encoder — a worse failure than the audio-first tmcd it fixes.
+  // Once this exceeds AUDIO_DROP_GATE_MAX_LEADING_DROP the gate fails OPEN: it
+  // latches, logs, and passes all audio. A correct recording with a possibly
+  // audio-first tmcd beats a recording with an invalid audio trak (ADR-0033/0035
+  // best-effort posture).
+  std::atomic<guint64> dropped_before_video{0};
+  std::atomic<bool> logged_fail_open{false};
 };
+
+// Upper bound on leading audio buffers dropped while the video origin is still
+// unknown, before the gate fails open. At 48 kHz / 1024-sample AAC frames this
+// is ~5 s of audio — far beyond the tens-of-ms leading slice the healthy path
+// drops, so it never trips in the normal case, but bounds the pathological
+// video-stall case to a finite, logged audio loss instead of a whole-take one.
+static constexpr guint64 AUDIO_DROP_GATE_MAX_LEADING_DROP = 240;
 
 // Per-probe user_data: a borrowed pointer to the shared context plus a shared
 // refcount so the context is freed only when the LAST of the two probes is
@@ -1465,8 +1486,21 @@ audio_drop_gate_audio_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_da
 
   guint64 video_rt = ctx->video_first_rt.load(std::memory_order_acquire);
   if (video_rt == GST_CLOCK_TIME_NONE) {
-    // Video origin not established yet: drop this leading audio buffer so it can
-    // never become the smaller first-buffer running-time at qtmux.
+    // Video origin not established yet. Drop this leading audio buffer so it can
+    // never become the smaller first-buffer running-time at qtmux — BUT bound the
+    // wait: if the video branch never delivers a running-time, failing open here
+    // keeps the audio trak valid rather than starving the AAC encoder (M1).
+    if (ctx->dropped_before_video.fetch_add(1, std::memory_order_relaxed) + 1 >=
+        AUDIO_DROP_GATE_MAX_LEADING_DROP) {
+      ctx->gate_open.store(true, std::memory_order_release);
+      if (!ctx->logged_fail_open.exchange(true, std::memory_order_acq_rel)) {
+        g_warning("audio-drop-gate fail-open: video running-time never arrived "
+                  "after %" G_GUINT64_FORMAT " dropped audio buffers; passing "
+                  "audio (tmcd may be audio-first for this take)",
+                  ctx->dropped.load(std::memory_order_relaxed));
+      }
+      return GST_PAD_PROBE_OK;
+    }
     ctx->dropped.fetch_add(1, std::memory_order_relaxed);
     return GST_PAD_PROBE_DROP;
   }

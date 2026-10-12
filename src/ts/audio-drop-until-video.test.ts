@@ -35,12 +35,14 @@ const canRun = arePluginsAvailable([
 async function countAudioSurvivors(opts: {
   gate: boolean;
   blockVideo: boolean;
+  audioBuffers?: number;
 }): Promise<number> {
+  const audioBuffers = opts.audioBuffers ?? 10;
   const pipelineStr =
     "videotestsrc name=vsrc num-buffers=30 is-live=false " +
     "! video/x-raw,format=I420,width=160,height=90,framerate=30/1 " +
     "! identity name=record_input_monitor ! fakesink name=vsink sync=false " +
-    "audiotestsrc name=asrc num-buffers=10 is-live=false samplesperbuffer=4410 " +
+    `audiotestsrc name=asrc num-buffers=${audioBuffers} is-live=false samplesperbuffer=4410 ` +
     "! queue name=record_audio_input_queue " +
     "! identity name=audio_tap ! fakesink name=asink sync=false";
 
@@ -93,6 +95,20 @@ describe.skipIf(!canRun)("attachAudioDropUntilVideo (drop-gate)", () => {
     // No video buffer ever established the origin, so every audio buffer is below
     // the (unknown) video origin and must be dropped — none reach the tap.
     expect(survivors).toBe(0);
+  });
+
+  it("fails OPEN after a bounded leading drop when video never arrives (M1)", async () => {
+    // Video stays blocked so the origin is NEVER established, but we push far more
+    // audio buffers than the native AUDIO_DROP_GATE_MAX_LEADING_DROP bound (240).
+    // Without the fail-open guard this would drop ALL of them (survivors = 0) and
+    // starve the audio trak on a real take. With the guard the gate latches open
+    // once the bound is exceeded, so the tail of the audio survives.
+    const survivors = await countAudioSurvivors({
+      gate: true,
+      blockVideo: true,
+      audioBuffers: 300,
+    });
+    expect(survivors).toBeGreaterThan(0);
   });
 
   it("passes audio when the gate is NOT installed (control)", async () => {
