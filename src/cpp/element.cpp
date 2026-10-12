@@ -1,6 +1,7 @@
 #include "element.hpp"
 #include "async-workers.hpp"
 #include "type-conversion.hpp"
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <functional>
@@ -88,6 +89,13 @@ Element::Element(const Napi::CallbackInfo &info) :
     },
     "attachSourceRateTimecode"
   );
+  auto attach_audio_drop_until_video_method = Napi::Function::New(
+    env,
+    [this](const Napi::CallbackInfo &info) -> Napi::Value {
+      return this->attach_audio_drop_until_video(info);
+    },
+    "attachAudioDropUntilVideo"
+  );
   auto set_pad_method = Napi::Function::New(
     env, [this](const Napi::CallbackInfo &info) -> Napi::Value { return this->set_pad(info); },
     "setPad"
@@ -125,6 +133,9 @@ Element::Element(const Napi::CallbackInfo &info) :
     ),
     Napi::PropertyDescriptor::Value(
       "attachSourceRateTimecode", attach_source_rate_timecode_method, napi_enumerable
+    ),
+    Napi::PropertyDescriptor::Value(
+      "attachAudioDropUntilVideo", attach_audio_drop_until_video_method, napi_enumerable
     ),
     Napi::PropertyDescriptor::Value("setPad", set_pad_method, napi_enumerable),
     Napi::PropertyDescriptor::Value("getPad", get_pad_method, napi_enumerable)
@@ -1336,6 +1347,238 @@ Napi::Value Element::attach_source_rate_timecode(const Napi::CallbackInfo &info)
     }
     return info.Env().Undefined();
   });
+}
+
+// ─── Audio drop-gate ─────────────────────────────────────────────────────────
+//
+// On an audio-ON camera-rate qtmux (.mov/h264_mov) take, qtmux (an aggregator)
+// writes the QuickTime `tmcd` track relative to whichever pad delivers the
+// SMALLEST first-buffer running-time as the media origin. When the AUDIO pad's
+// first buffer reaches qtmux before the VIDEO pad's (audio-first), the video
+// `tmcd` collapses to 00:00:00:00 even though the correct timecode was computed.
+// Video-first writes it correctly. Audio-OFF (single pad) is always correct.
+//
+// The gate forces VIDEO-first deterministically (proven 15/15 in the standalone
+// prototype) by dropping the small LEADING slice of audio buffers whose
+// running-time is below the first video buffer's running-time, so every
+// surviving audio buffer starts at or after the video origin and qtmux selects
+// the VIDEO pad as the media origin.
+//
+// THREE requirements the prototype proved mandatory (do NOT deviate):
+//   1. Gate on RUNNING-TIME (segment-mapped PTS), not wall-clock. A naive
+//      "video seen" flag does not flip the order if surviving audio still carries
+//      a lower PTS.
+//   2. DROP BUFFERS ONLY (GST_PAD_PROBE_DROP for sub-threshold buffers); let
+//      caps/segment/other events pass, or the AAC encoder starves and the audio
+//      trak is invalid.
+//   3. Drop only the leading slice, then LATCH open (return OK once an audio
+//      buffer reaches the threshold) — never drop steady-state audio.
+//
+// Both probes are DEDICATED native buffer probes that decide synchronously on the
+// streaming thread (no ThreadSafeFunction/JS hop); add_pad_probe's async path
+// cannot return DROP synchronously, which is why this is its own probe.
+struct AudioDropGateContext {
+  // The first VIDEO buffer's running-time, in ns. GST_CLOCK_TIME_NONE until the
+  // video probe records it. Written once by the video probe, read by the audio
+  // probe; both run on their own streaming threads, so this is atomic.
+  std::atomic<guint64> video_first_rt{GST_CLOCK_TIME_NONE};
+  // Latch: once an audio buffer has passed (reached the video origin), all
+  // subsequent audio buffers pass without a running-time check (requirement 3).
+  std::atomic<bool> gate_open{false};
+  // Count of leading audio buffers dropped, for the audio-drop-gate marker.
+  std::atomic<guint64> dropped{0};
+  std::atomic<bool> logged_open{false};
+};
+
+// Per-probe user_data: a borrowed pointer to the shared context plus a shared
+// refcount so the context is freed only when the LAST of the two probes is
+// removed (each probe's destroy notify drops one count). The probe callbacks
+// unwrap `ctx` from this — passing the bare context would make the two probes'
+// destroy notifies double-free it.
+struct AudioDropGateProbeOwner {
+  AudioDropGateContext *ctx;
+  std::atomic<int> *refcount;
+};
+
+// Segment-mapped running-time of a buffer, mirroring first_frame_clock_probe:
+// prefer the pad's sticky TIME segment, else fall back to the raw PTS.
+static guint64 audio_drop_gate_running_time(GstPad *pad, GstBuffer *buffer) {
+  if (!GST_BUFFER_PTS_IS_VALID(buffer))
+    return GST_CLOCK_TIME_NONE;
+  guint64 rt = GST_CLOCK_TIME_NONE;
+  GstEvent *seg_event = gst_pad_get_sticky_event(pad, GST_EVENT_SEGMENT, 0);
+  if (seg_event) {
+    const GstSegment *seg = NULL;
+    gst_event_parse_segment(seg_event, &seg);
+    if (seg && seg->format == GST_FORMAT_TIME)
+      rt = gst_segment_to_running_time(seg, GST_FORMAT_TIME, GST_BUFFER_PTS(buffer));
+    gst_event_unref(seg_event);
+  }
+  if (rt == GST_CLOCK_TIME_NONE)
+    rt = GST_BUFFER_PTS(buffer);
+  return rt;
+}
+
+// Video-branch probe: record the first video buffer's running-time once, then
+// self-remove. Buffers only; everything passes (never drops video).
+static GstPadProbeReturn
+audio_drop_gate_video_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+  AudioDropGateContext *ctx =
+    static_cast<AudioDropGateProbeOwner *>(user_data)->ctx;
+  if (!(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER))
+    return GST_PAD_PROBE_OK;
+  GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+  if (!buffer)
+    return GST_PAD_PROBE_OK;
+  // Record only the FIRST video buffer's running-time; ignore the rest. We do
+  // NOT self-remove (GST_PAD_PROBE_REMOVE) — detach removes both probes together,
+  // and a self-remove here would make detach's gst_pad_remove_probe warn about a
+  // probe id that is already gone. A cheap already-set check keeps steady-state
+  // overhead to one atomic load.
+  if (ctx->video_first_rt.load(std::memory_order_acquire) != GST_CLOCK_TIME_NONE)
+    return GST_PAD_PROBE_OK;
+  guint64 rt = audio_drop_gate_running_time(pad, buffer);
+  if (rt == GST_CLOCK_TIME_NONE)
+    return GST_PAD_PROBE_OK; // wait for a buffer that carries a running-time
+  ctx->video_first_rt.store(rt, std::memory_order_release);
+  return GST_PAD_PROBE_OK;
+}
+
+// Audio-branch probe (front of the branch): DROP each leading audio buffer whose
+// running-time is below the recorded video origin (or while the origin is still
+// unknown); pass everything once an audio buffer reaches the origin, then latch.
+// Buffers only — caps/segment/other events are not seen here (BUFFER probe type)
+// and therefore always flow (requirement 2).
+static GstPadProbeReturn
+audio_drop_gate_audio_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+  AudioDropGateContext *ctx =
+    static_cast<AudioDropGateProbeOwner *>(user_data)->ctx;
+  if (!(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER))
+    return GST_PAD_PROBE_OK;
+
+  if (ctx->gate_open.load(std::memory_order_acquire))
+    return GST_PAD_PROBE_OK; // latched open — never drop steady-state audio
+
+  GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+  if (!buffer)
+    return GST_PAD_PROBE_OK;
+
+  guint64 video_rt = ctx->video_first_rt.load(std::memory_order_acquire);
+  if (video_rt == GST_CLOCK_TIME_NONE) {
+    // Video origin not established yet: drop this leading audio buffer so it can
+    // never become the smaller first-buffer running-time at qtmux.
+    ctx->dropped.fetch_add(1, std::memory_order_relaxed);
+    return GST_PAD_PROBE_DROP;
+  }
+
+  guint64 audio_rt = audio_drop_gate_running_time(pad, buffer);
+  if (audio_rt != GST_CLOCK_TIME_NONE && audio_rt < video_rt) {
+    ctx->dropped.fetch_add(1, std::memory_order_relaxed);
+    return GST_PAD_PROBE_DROP;
+  }
+
+  // This audio buffer starts at or after the video origin: open the gate (latch)
+  // and let it — and everything after — through.
+  ctx->gate_open.store(true, std::memory_order_release);
+  if (!ctx->logged_open.exchange(true, std::memory_order_acq_rel)) {
+    g_message("audio-drop-gate opened: video-first-rt=%" G_GUINT64_FORMAT
+              "ns first-pass-audio-rt=%" G_GUINT64_FORMAT "ns dropped=%" G_GUINT64_FORMAT,
+              video_rt, audio_rt, ctx->dropped.load(std::memory_order_relaxed));
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+Napi::Value Element::attach_audio_drop_until_video(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  if (!element.get()) {
+    Napi::TypeError::New(env, "Element is null or not initialized")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsObject()) {
+    Napi::TypeError::New(env, "attachAudioDropUntilVideo requires an options object")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object opts = info[0].As<Napi::Object>();
+  if (!opts.Has("videoElement") || !opts.Get("videoElement").IsObject()) {
+    Napi::TypeError::New(env, "attachAudioDropUntilVideo: options.videoElement (an Element) required")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Element *videoWrap =
+    Napi::ObjectWrap<Element>::Unwrap(opts.Get("videoElement").As<Napi::Object>());
+  if (!videoWrap || !videoWrap->element.get()) {
+    Napi::TypeError::New(env, "attachAudioDropUntilVideo: videoElement is not a valid Element")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  GstElement *video_element = videoWrap->element.get();
+
+  // Video probe on the video element's src pad: earliest reliable point where the
+  // first real video buffer carries a running-time. Audio probe at the FRONT of
+  // the audio branch, this element's sink pad.
+  GstPad *video_pad = gst_element_get_static_pad(video_element, "src");
+  if (!video_pad) {
+    Napi::Error::New(env, "attachAudioDropUntilVideo: videoElement has no 'src' pad")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  GstPad *audio_pad = gst_element_get_static_pad(element.get(), "sink");
+  if (!audio_pad) {
+    gst_object_unref(video_pad);
+    Napi::Error::New(env, "attachAudioDropUntilVideo: audio element has no 'sink' pad")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  // One shared context, freed by whichever probe's destroy notify fires last.
+  // A shared refcount guards the delete: each probe holds one count, each detach
+  // drops it, and the context is deleted when the last probe is removed.
+  AudioDropGateContext *ctx = new AudioDropGateContext();
+  auto *refcount = new std::atomic<int>(2);
+
+  auto *video_owner = new AudioDropGateProbeOwner{ctx, refcount};
+  auto *audio_owner = new AudioDropGateProbeOwner{ctx, refcount};
+  auto destroy_owner = [](gpointer data) {
+    AudioDropGateProbeOwner *owner = static_cast<AudioDropGateProbeOwner *>(data);
+    if (owner->refcount->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      delete owner->ctx;
+      delete owner->refcount;
+    }
+    delete owner;
+  };
+
+  g_message("audio-drop-gate armed: dropping leading audio until first video running-time");
+
+  gulong video_probe_id = gst_pad_add_probe(
+    video_pad, GST_PAD_PROBE_TYPE_BUFFER, audio_drop_gate_video_probe, video_owner,
+    destroy_owner);
+  gulong audio_probe_id = gst_pad_add_probe(
+    audio_pad, GST_PAD_PROBE_TYPE_BUFFER, audio_drop_gate_audio_probe, audio_owner,
+    destroy_owner);
+
+  // Keep refs for the detach closure; drop our locals (the probes keep the pads
+  // reachable). Detach removes both probes, firing their destroy notifies.
+  auto *video_pad_ref = static_cast<GstPad *>(gst_object_ref(video_pad));
+  auto *audio_pad_ref = static_cast<GstPad *>(gst_object_ref(audio_pad));
+  gst_object_unref(video_pad);
+  gst_object_unref(audio_pad);
+  auto detached = std::make_shared<bool>(false);
+
+  return Napi::Function::New(
+    env,
+    [video_pad_ref, video_probe_id, audio_pad_ref, audio_probe_id, detached](
+      const Napi::CallbackInfo &info) -> Napi::Value {
+      if (!*detached) {
+        *detached = true;
+        gst_pad_remove_probe(video_pad_ref, video_probe_id);
+        gst_pad_remove_probe(audio_pad_ref, audio_probe_id);
+        gst_object_unref(video_pad_ref);
+        gst_object_unref(audio_pad_ref);
+      }
+      return info.Env().Undefined();
+    });
 }
 
 Napi::Value Element::push(const Napi::CallbackInfo &info) {

@@ -221,6 +221,15 @@ export type AttachSourceRateTimecodeOptions = {
   repeat: number;
 };
 
+export type AttachAudioDropUntilVideoOptions = {
+  // The VIDEO element whose src pad carries the first video buffer's running-time.
+  // The gate drops leading audio buffers (on the element this is called on — the
+  // front of the audio branch) whose running-time is below that video origin, so
+  // qtmux selects the video pad as the media origin and writes the `tmcd` track
+  // correctly. Must be an Element from the SAME pipeline.
+  videoElement: ElementBase;
+};
+
 export type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
   setElementProperty: (key: string, value: GStreamerPropertyValue) => void;
@@ -244,6 +253,14 @@ export type ElementBase = {
   // Call on a passthrough element (e.g. `identity`) just before the muxer.
   // Returns a detach function. (ADR-0038a / ARKP-1549.)
   attachSourceRateTimecode: (options: AttachSourceRateTimecodeOptions) => () => void;
+  // Install the audio drop-gate. Call on the element at the FRONT of
+  // the audio branch (e.g. `record_audio_input_queue`); pass the VIDEO element
+  // (e.g. `record_input_monitor`) in `options.videoElement`. Drops leading audio
+  // buffers whose running-time is below the first video buffer's running-time,
+  // then latches open, forcing `qtmux` to select the video pad as the media
+  // origin so the QuickTime `tmcd` track is written relative to video. Buffers
+  // only; caps/segment events pass. Returns a detach function.
+  attachAudioDropUntilVideo: (options: AttachAudioDropUntilVideoOptions) => () => void;
   setPad: (attribute: string, padName: string) => void;
   getPad: (padName: string) => GstPad | null;
 };

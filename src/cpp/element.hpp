@@ -33,6 +33,17 @@ public:
   // LTC source rate on a camera-rate video track. Returns a detach function.
   // (ADR-0038a / ARKP-1549.)
   Napi::Value attach_source_rate_timecode(const Napi::CallbackInfo &info);
+  // Audio drop-gate. Install two coordinated buffer probes sharing one
+  // atomic "first video running-time": a probe on the VIDEO element's src pad
+  // records the first video buffer's running-time once, and a probe at the FRONT
+  // of the AUDIO branch (this element's sink pad) DROPs each leading audio buffer
+  // whose running-time is below that video origin (or while it is unknown),
+  // latching to pass-through once an audio buffer reaches it. Forces `qtmux` to
+  // select the VIDEO pad as the media origin so the QuickTime `tmcd` track is
+  // written relative to video, not audio-first. Drops buffers only; caps/segment/
+  // other events always pass. Returns a detach function that removes both probes.
+  // Called on the audio element; the video element rides in `options.videoElement`.
+  Napi::Value attach_audio_drop_until_video(const Napi::CallbackInfo &info);
   // Unwrap an optional { baseTimeElement } JS Element to a borrowed GstElement*,
   // or nullptr when absent/invalid. Static member so it may read the wrapped
   // Element's private handle. The caller takes an owning ref.

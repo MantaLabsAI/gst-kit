@@ -6,7 +6,9 @@ let node_path = require("node:path");
 let node_url = require("node:url");
 let node_module = require("node:module");
 //#region src/ts/index.ts
-const projectRoot = (0, node_path.join)((0, node_path.dirname)((0, node_url.fileURLToPath)(require("url").pathToFileURL(__filename).href)), "../../");
+const __filename$1 = (0, node_url.fileURLToPath)(require("url").pathToFileURL(__filename).href);
+const __dirname$1 = (0, node_path.dirname)(__filename$1);
+const projectRoot = (0, node_path.join)(__dirname$1, "../../");
 const nativeAddon = (0, node_module.createRequire)(require("url").pathToFileURL(__filename).href)((0, node_path.join)(projectRoot, "build/Release/gst_kit.node"));
 /**
 * https://gstreamer.freedesktop.org/documentation/gstreamer/gstbuffer.html?gi-language=c#GstBufferFlags
