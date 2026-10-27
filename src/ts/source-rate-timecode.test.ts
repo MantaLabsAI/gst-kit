@@ -77,6 +77,72 @@ describe.skipIf(!hasTimecodeStamper)("attachSourceRateTimecode", () => {
     expect(last.frames).toBeLessThanOrEqual(10);
   });
 
+  it("follows the upstream (head-drop-advanced) camera meta, not its own counter (ARKP-1588)", async () => {
+    // Simulate a head drop: the upstream timecodestamper is seeded at camera
+    // frame 2 (as `nvtcburnin` would after advancing `internal_tc` by a dropped
+    // 2-frame gap), while the author is seeded at source frame 0. With the old
+    // local-counter behaviour the first authored frame would be seed + floor(0/2)
+    // = 0; with the meta-driven fix it must be floor(2/2) = 1, matching where the
+    // burn-in landed.
+    const metas = await collectAuthoredMeta(
+      "videotestsrc num-buffers=20 ! video/x-raw,format=I420,width=160,height=90,framerate=60/1 " +
+        "! timecodestamper source=internal set-internal-timecode=10:00:00:02 drop-frame=false " +
+        "! identity name=author ! fakesink name=sink sync=false",
+      "author",
+      {
+        timecode: { hours: 10, minutes: 0, seconds: 0, frames: 0 },
+        rate: { numerator: 30, denominator: 1 },
+        repeat: 2,
+      },
+    );
+    expect(metas.length).toBeGreaterThan(0);
+    // First authored source frame reflects the ADVANCED camera meta (2/2 = 1),
+    // NOT the un-advanced counter (0).
+    expect(metas[0].frames).toBe(1);
+  });
+
+  it("stays byte-identical to the counter on a clean start (frame 0, ARKP-1588)", async () => {
+    // Clean start: upstream camera meta begins at frame 0, so camera_ff/repeat ==
+    // floor(frame_index/repeat). The authored first frame must still be 0 — the
+    // fix changes nothing when no head drop occurred.
+    const metas = await collectAuthoredMeta(
+      "videotestsrc num-buffers=20 ! video/x-raw,format=I420,width=160,height=90,framerate=60/1 " +
+        "! timecodestamper source=internal set-internal-timecode=10:00:00:00 drop-frame=false " +
+        "! identity name=author ! fakesink name=sink sync=false",
+      "author",
+      {
+        timecode: { hours: 10, minutes: 0, seconds: 0, frames: 0 },
+        rate: { numerator: 30, denominator: 1 },
+        repeat: 2,
+      },
+    );
+    expect(metas.length).toBeGreaterThan(0);
+    expect(metas[0].frames).toBe(0);
+    // Label-repeat still holds off the camera meta: 0,0,1,1,2,2,…
+    metas.forEach((m, i) => expect(m.frames).toBe(Math.floor(i / 2)));
+  });
+
+  it("reads the drop-frame flag off the upstream camera meta (DF-correct, ARKP-1588)", async () => {
+    // 59.94 camera / 29.97 source with a drop-frame upstream meta. The author
+    // must read DF off the camera meta and author a DF source-rate label.
+    const metas = await collectAuthoredMeta(
+      "videotestsrc num-buffers=12 ! video/x-raw,format=I420,width=160,height=90,framerate=60000/1001 " +
+        "! timecodestamper source=internal set-internal-timecode=10:00:00;00 drop-frame=true " +
+        "! identity name=author ! fakesink name=sink sync=false",
+      "author",
+      {
+        timecode: { hours: 10, minutes: 0, seconds: 0, frames: 0, dropFrame: true },
+        rate: { numerator: 30000, denominator: 1001 },
+        repeat: 2,
+      },
+    );
+    expect(metas.length).toBeGreaterThan(0);
+    for (const tc of metas) {
+      expect(tc.dropFrame).toBe(true);
+      expect(tc.frames).toBeLessThanOrEqual(29);
+    }
+  });
+
   it("repeats each source label across `repeat` video frames (label-repeat)", async () => {
     const metas = await collectAuthoredMeta(
       "videotestsrc num-buffers=8 ! video/x-raw,format=I420,width=160,height=90,framerate=60/1 " +

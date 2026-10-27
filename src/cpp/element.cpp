@@ -1198,10 +1198,17 @@ Napi::Value Element::attach_sub_frame_overlay(const Napi::CallbackInfo &info) {
 // track — exactly the rate-mismatch shape ADR-0037 flagged as the NLE risk.
 //
 // This is a SEPARATE element from the sub-frame overlay (ADR-0038a decision E):
-// the overlay upstream still reads the camera-rate `tc_stamper` meta and divides
-// it to `.n`, while THIS element downstream overwrites the meta with the
-// source-rate label just before the muxer. The two never read each other's
-// meta, so there is no double-divide.
+// the overlay upstream reads the camera-rate `tc_stamper` meta and divides it to
+// `.n`. THIS element downstream READS the same upstream camera-rate meta, divides
+// it to the source label (`source_ff = camera_ff / repeat`), then overwrites the
+// meta with that source-rate label just before the muxer. Both machines thus
+// derive from the ONE camera-rate basis `nvtcburnin`/`tc_stamper` stamped — which
+// is already head-drop-advanced (ARKP-1588) — so the authored `tmcd` matches the
+// burn-in by construction even when a pre-settle head frame is dropped. The
+// author still REMOVES the camera-rate meta after reading it, so downstream sees
+// only the source-rate tmcd and there is no double-divide. The streaming-local
+// `frame_index` counter remains ONLY as a fallback for buffers with no upstream
+// meta (preserving the prior seed+counter behaviour in that case).
 //
 // Drop-frame correctness is non-negotiable (code review finding #2): the label
 // is built and advanced with GStreamer's own `GstVideoTimeCode` at the
@@ -1232,33 +1239,64 @@ source_rate_timecode_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_dat
     return GST_PAD_PROBE_OK;
 
   const guint repeat = ctx->repeat > 0 ? ctx->repeat : 1;
-  const guint64 i = ctx->frame_index++;
-  // Label-repeat: the same source label spans `repeat` video frames, then the
-  // source frame advances. floor(i / repeat) source frames have elapsed by
-  // buffer i, so the source label at buffer i is seed + floor(i / repeat).
-  const guint64 source_frames_elapsed = i / repeat;
 
-  // Build the source-rate label with GStreamer's own representation so the
-  // drop-frame arithmetic (NTSC x/1001) is correct — never a hand-built x/1.
-  GstVideoTimeCodeFlags flags =
-    ctx->drop_frame ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
-  GstVideoTimeCode *tc = gst_video_time_code_new(
-    ctx->source_fps_n, ctx->source_fps_d, NULL, flags,
-    ctx->seed_hh, ctx->seed_mm, ctx->seed_ss, ctx->seed_ff, 0);
-  if (!tc)
-    return GST_PAD_PROBE_OK; // invalid TC (e.g. DF at a non-x/1001 rate) → leave buffer untouched
-  if (source_frames_elapsed > 0)
-    gst_video_time_code_add_frames(tc, (gint64)source_frames_elapsed);
-
-  // Overwrite (or add) the buffer's timecode meta with the source-rate label.
-  // The buffer must be writable to carry a fresh meta; the probe owns the buffer
-  // on the streaming thread, so make it writable in place.
+  // Make the buffer writable BEFORE reading the upstream meta: we both read the
+  // camera-rate meta (preferred path) and remove/replace it, and the probe owns
+  // the buffer on the streaming thread.
   GstBuffer *writable = gst_buffer_make_writable(buffer);
   if (writable) {
     GST_PAD_PROBE_INFO_DATA(info) = writable;
     buffer = writable;
-    // Drop any upstream (camera-rate) timecode meta so qtmux boxes only ours.
-    GstVideoTimeCodeMeta *existing = gst_buffer_get_video_time_code_meta(buffer);
+  }
+
+  GstVideoTimeCode *tc = NULL;
+
+  // Preferred path: read the upstream camera-rate timecode meta (`tc_stamper`'s)
+  // and divide it down to the source label, exactly as the sub-frame overlay does
+  // upstream. That camera meta already carries any head-drop advance (ARKP-1588),
+  // so the authored source label lands on the SAME frame as the burn-in. On a
+  // clean start (no head drop) `existing->tc.frames == old frame_index count`, so
+  // `camera_ff / repeat` equals the prior `floor(i / repeat)` and the authored
+  // label is byte-identical to the previous behaviour — the ONLY change is under
+  // a head drop. The drop-frame flag is read off the meta (so video0 29.97 DF and
+  // video1 30 NDF are each correct) and the TC is built at the context's source
+  // rational so GStreamer owns the DF arithmetic.
+  GstVideoTimeCodeMeta *existing =
+    writable ? gst_buffer_get_video_time_code_meta(buffer) : NULL;
+  if (existing) {
+    const GstVideoTimeCode *cam = &existing->tc;
+    const gboolean df =
+      (cam->config.flags & GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME) != 0;
+    const GstVideoTimeCodeFlags flags =
+      df ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
+    const guint source_ff = cam->frames / repeat;
+    // HH:MM:SS:source_ff IS the final absolute label — the camera meta already
+    // holds the head-drop-advanced position, so do NOT add from seed (no
+    // double-divide).
+    tc = gst_video_time_code_new(ctx->source_fps_n, ctx->source_fps_d, NULL, flags,
+                                 cam->hours, cam->minutes, cam->seconds, source_ff, 0);
+  } else {
+    // Fallback: no upstream meta on this buffer. Count from the seed with the
+    // streaming-local index — the prior behaviour, preserved verbatim.
+    const guint64 i = ctx->frame_index++;
+    // Label-repeat: the same source label spans `repeat` video frames, then the
+    // source frame advances. floor(i / repeat) source frames have elapsed by
+    // buffer i, so the source label at buffer i is seed + floor(i / repeat).
+    const guint64 source_frames_elapsed = i / repeat;
+    const GstVideoTimeCodeFlags flags =
+      ctx->drop_frame ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
+    tc = gst_video_time_code_new(ctx->source_fps_n, ctx->source_fps_d, NULL, flags,
+                                 ctx->seed_hh, ctx->seed_mm, ctx->seed_ss, ctx->seed_ff, 0);
+    if (tc && source_frames_elapsed > 0)
+      gst_video_time_code_add_frames(tc, (gint64)source_frames_elapsed);
+  }
+
+  if (!tc)
+    return GST_PAD_PROBE_OK; // invalid TC (e.g. DF at a non-x/1001 rate) → leave buffer untouched
+
+  // Overwrite the buffer's timecode meta with the source-rate label. Reading of
+  // the camera-rate meta (above) already happened, so removing it now is safe.
+  if (writable) {
     if (existing)
       gst_buffer_remove_meta(buffer, (GstMeta *)existing);
     gst_buffer_add_video_time_code_meta(buffer, tc);
