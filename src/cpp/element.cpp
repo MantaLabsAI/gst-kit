@@ -1240,14 +1240,24 @@ source_rate_timecode_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_dat
 
   const guint repeat = ctx->repeat > 0 ? ctx->repeat : 1;
 
+  // Advance the streaming-local counter for EVERY buffer, before any branch, so
+  // it always tracks buffers received. It is only CONSUMED on the no-meta
+  // fallback below, but keeping it in step means that if a stream ever mixed
+  // meta-bearing and meta-less buffers the fallback would still count from the
+  // right position rather than a stale index (ARKP-1588 review M2).
+  const guint64 i = ctx->frame_index++;
+
   // Make the buffer writable BEFORE reading the upstream meta: we both read the
   // camera-rate meta (preferred path) and remove/replace it, and the probe owns
-  // the buffer on the streaming thread.
+  // the buffer on the streaming thread. If it cannot be made writable (only on
+  // allocation failure — a live streaming buffer ref-copies instead), pass the
+  // buffer through untouched with no side effects rather than author a label we
+  // cannot attach (ARKP-1588 review m1).
   GstBuffer *writable = gst_buffer_make_writable(buffer);
-  if (writable) {
-    GST_PAD_PROBE_INFO_DATA(info) = writable;
-    buffer = writable;
-  }
+  if (!writable)
+    return GST_PAD_PROBE_OK;
+  GST_PAD_PROBE_INFO_DATA(info) = writable;
+  buffer = writable;
 
   GstVideoTimeCode *tc = NULL;
 
@@ -1261,8 +1271,7 @@ source_rate_timecode_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_dat
   // a head drop. The drop-frame flag is read off the meta (so video0 29.97 DF and
   // video1 30 NDF are each correct) and the TC is built at the context's source
   // rational so GStreamer owns the DF arithmetic.
-  GstVideoTimeCodeMeta *existing =
-    writable ? gst_buffer_get_video_time_code_meta(buffer) : NULL;
+  GstVideoTimeCodeMeta *existing = gst_buffer_get_video_time_code_meta(buffer);
   if (existing) {
     const GstVideoTimeCode *cam = &existing->tc;
     const gboolean df =
@@ -1277,11 +1286,10 @@ source_rate_timecode_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_dat
                                  cam->hours, cam->minutes, cam->seconds, source_ff, 0);
   } else {
     // Fallback: no upstream meta on this buffer. Count from the seed with the
-    // streaming-local index — the prior behaviour, preserved verbatim.
-    const guint64 i = ctx->frame_index++;
-    // Label-repeat: the same source label spans `repeat` video frames, then the
-    // source frame advances. floor(i / repeat) source frames have elapsed by
-    // buffer i, so the source label at buffer i is seed + floor(i / repeat).
+    // streaming-local index `i` (advanced for every buffer above) — the prior
+    // behaviour, preserved. Label-repeat: the same source label spans `repeat`
+    // video frames, then the source frame advances. floor(i / repeat) source
+    // frames have elapsed by buffer i, so the source label is seed + that.
     const guint64 source_frames_elapsed = i / repeat;
     const GstVideoTimeCodeFlags flags =
       ctx->drop_frame ? GST_VIDEO_TIME_CODE_FLAGS_DROP_FRAME : GST_VIDEO_TIME_CODE_FLAGS_NONE;
@@ -1294,13 +1302,12 @@ source_rate_timecode_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_dat
   if (!tc)
     return GST_PAD_PROBE_OK; // invalid TC (e.g. DF at a non-x/1001 rate) → leave buffer untouched
 
-  // Overwrite the buffer's timecode meta with the source-rate label. Reading of
-  // the camera-rate meta (above) already happened, so removing it now is safe.
-  if (writable) {
-    if (existing)
-      gst_buffer_remove_meta(buffer, (GstMeta *)existing);
-    gst_buffer_add_video_time_code_meta(buffer, tc);
-  }
+  // Overwrite the buffer's timecode meta with the source-rate label. The buffer
+  // is guaranteed writable here (early-return above), and the camera-rate meta
+  // was already read, so removing it now is safe.
+  if (existing)
+    gst_buffer_remove_meta(buffer, (GstMeta *)existing);
+  gst_buffer_add_video_time_code_meta(buffer, tc);
   gst_video_time_code_free(tc);
   return GST_PAD_PROBE_OK;
 }

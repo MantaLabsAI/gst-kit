@@ -143,6 +143,45 @@ describe.skipIf(!hasTimecodeStamper)("attachSourceRateTimecode", () => {
     }
   });
 
+  it("authors a DF source label correctly across a non-tenth minute boundary (ARKP-1588 M1)", async () => {
+    // 59.94 camera / 29.97 source, DF. Seed the upstream stamper just before the
+    // 10:01:00 boundary (a non-tenth minute, so drop-frame SKIPS source frames
+    // 0 and 1). Crossing it exercises whether `camera_ff / repeat` authored off
+    // the camera meta yields a LEGAL, correct DF source label at the skip — the
+    // one place the single-basis division could be wrong on a DF take. The author
+    // must never emit an illegal DF source frame (;00 or ;01 at :01:00 on a
+    // non-tenth minute) and the whole-frame value must track the camera meta / 2.
+    const metas = await collectAuthoredMeta(
+      "videotestsrc num-buffers=20 ! video/x-raw,format=I420,width=160,height=90,framerate=60000/1001 " +
+        "! timecodestamper source=internal set-internal-timecode=10:00:59;56 drop-frame=true " +
+        "! identity name=author ! fakesink name=sink sync=false",
+      "author",
+      {
+        timecode: { hours: 10, minutes: 0, seconds: 59, frames: 28, dropFrame: true },
+        rate: { numerator: 30000, denominator: 1001 },
+        repeat: 2,
+      },
+    );
+    expect(metas.length).toBeGreaterThan(0);
+    // Every authored label must be a LEGAL 29.97 DF timecode: no 29.97-DF stream
+    // may show ;00 or ;01 at the first second of a non-tenth minute.
+    for (const tc of metas) {
+      expect(tc.dropFrame).toBe(true);
+      expect(tc.frames).toBeLessThanOrEqual(29);
+      const illegalDrop =
+        tc.seconds === 0 && tc.minutes % 10 !== 0 && (tc.frames === 0 || tc.frames === 1);
+      expect(illegalDrop).toBe(false);
+    }
+    // The sequence MUST cross into 10:01:00, and the first authored frame there
+    // must be the legal post-skip ;02 (not ;00/;01) — i.e. the camera-meta
+    // division produced a DF-correct source label at the boundary. Asserted
+    // unconditionally: if the boundary was never reached the test must fail
+    // rather than pass vacuously.
+    const atBoundary = metas.find((tc) => tc.minutes === 1 && tc.seconds === 0);
+    expect(atBoundary, "sequence did not cross the 10:01:00 boundary").toBeDefined();
+    expect(atBoundary!.frames).toBe(2);
+  });
+
   it("repeats each source label across `repeat` video frames (label-repeat)", async () => {
     const metas = await collectAuthoredMeta(
       "videotestsrc num-buffers=8 ! video/x-raw,format=I420,width=160,height=90,framerate=60/1 " +
