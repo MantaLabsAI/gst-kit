@@ -230,6 +230,31 @@ export type AttachAudioDropUntilVideoOptions = {
   videoElement: ElementBase;
 };
 
+export type AttachBufferGapMonitorOptions = {
+  // Label printed in the log lines (e.g. "ingest-src", "record-in").
+  stage: string;
+  // Expected frame rate; the anomaly thresholds are 1.5x / 0.5x the frame duration.
+  fpsNum: number;
+  fpsDen: number;
+  // Which pad of this element to probe. Defaults to "src".
+  pad?: "src" | "sink";
+};
+
+export type BufferGapMonitorStats = {
+  buffers: number;
+  gaps: number;
+  lastGapPtsNs: number;
+  lastGapNs: number;
+  maxGapNs: number;
+  backwards: number;
+  early: number;
+};
+
+export type BufferGapMonitor = {
+  stats: () => BufferGapMonitorStats;
+  detach: () => void;
+};
+
 export type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
   setElementProperty: (key: string, value: GStreamerPropertyValue) => void;
@@ -261,6 +286,11 @@ export type ElementBase = {
   // origin so the QuickTime `tmcd` track is written relative to video. Buffers
   // only; caps/segment events pass. Returns a detach function.
   attachAudioDropUntilVideo: (options: AttachAudioDropUntilVideoOptions) => () => void;
+  // Attach a persistent native buffer probe (streaming thread, no JS hop) that
+  // logs one `buffer.first` line and one `buffer.gap` line per PTS anomaly
+  // (gap > 1.5x, backwards, or early < 0.5x frame duration) via g_message, with a
+  // g_get_monotonic_time() timestamp. stats() reads live counters.
+  attachBufferGapMonitor: (options: AttachBufferGapMonitorOptions) => BufferGapMonitor;
   setPad: (attribute: string, padName: string) => void;
   getPad: (padName: string) => GstPad | null;
 };

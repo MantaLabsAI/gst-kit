@@ -1,7 +1,7 @@
 //#region src/ts/index.d.ts
-export type GStreamerPropertyPrimitiveValue = string | number | boolean | bigint;
-export type GStreamerPropertyValue = GStreamerPropertyPrimitiveValue | GStreamerPropertyPrimitiveValue[];
-export type GStreamerSample = {
+type GStreamerPropertyPrimitiveValue = string | number | boolean | bigint;
+type GStreamerPropertyValue = GStreamerPropertyPrimitiveValue | GStreamerPropertyPrimitiveValue[];
+type GStreamerSample = {
   buffer?: Buffer;
   pts?: number;
   dts?: number;
@@ -14,7 +14,7 @@ export type GStreamerSample = {
     [key: string]: GStreamerPropertyValue | undefined;
   };
 };
-export type GstMessage = {
+type GstMessage = {
   type: string;
   srcElementName?: string;
   timestamp: bigint;
@@ -31,8 +31,8 @@ export type GstMessage = {
   newState?: number;
   pendingState?: number;
 };
-export type GStreamerPropertyReturnValue = GStreamerPropertyValue | Record<string, GStreamerPropertyValue> | Buffer | GStreamerSample | null;
-export type GStreamerPropertyResult = {
+type GStreamerPropertyReturnValue = GStreamerPropertyValue | Record<string, GStreamerPropertyValue> | Buffer | GStreamerSample | null;
+type GStreamerPropertyResult = {
   type: "primitive";
   value: GStreamerPropertyPrimitiveValue;
 } | {
@@ -48,23 +48,23 @@ export type GStreamerPropertyResult = {
   type: "sample";
   value: GStreamerSample;
 } | null;
-export type StateChangeResult = {
+type StateChangeResult = {
   result: "success" | "async" | "no-preroll" | "failure" | "unknown";
   finalState: number;
   targetState: number;
 };
-export type RTPData = {
+type RTPData = {
   timestamp: number;
   sequence: number;
   ssrc: number;
   payloadType: number;
 };
-export type GstPad = {
+type GstPad = {
   name: string;
   direction: number;
   caps: string | null;
 };
-export type BufferData = {
+type BufferData = {
   buffer?: Buffer;
   pts?: number;
   dts?: number;
@@ -86,28 +86,28 @@ export type BufferData = {
     rate: Rational;
   };
 };
-export type SampleFirstFrameClockOptions = {
+type SampleFirstFrameClockOptions = {
   baseTimeElement?: ElementBase;
 };
-export type FirstFrameClockSample = {
+type FirstFrameClockSample = {
   runningTimeNs?: number;
   baseTimeNs?: number;
   gstClockNs?: number;
   monotonicNs?: number;
   baseClockMatched?: boolean;
 };
-export type Rational = {
+type Rational = {
   numerator: number;
   denominator: number;
 };
-export type TimecodeValue = {
+type TimecodeValue = {
   hours: number;
   minutes: number;
   seconds: number;
   frames: number;
   dropFrame?: boolean;
 };
-export type SetFirstFrameTimecodeOptions = {
+type SetFirstFrameTimecodeOptions = {
   timecode: TimecodeValue;
   rate?: Rational;
   baseTimeElement?: ElementBase;
@@ -115,7 +115,7 @@ export type SetFirstFrameTimecodeOptions = {
     anchoredAtNs: number;
   };
 };
-export type FirstFrameTimecodeResult = {
+type FirstFrameTimecodeResult = {
   timecode: string;
   pts?: number;
   framerate: Rational;
@@ -123,20 +123,39 @@ export type FirstFrameTimecodeResult = {
   advancedFrames: number;
   clockBridge: FirstFrameClockSample;
 };
-export type AttachSubFrameOverlayOptions = {
+type AttachSubFrameOverlayOptions = {
   timecode: TimecodeValue;
   rate?: Rational;
   repeat: number;
 };
-export type AttachSourceRateTimecodeOptions = {
+type AttachSourceRateTimecodeOptions = {
   timecode: TimecodeValue;
   rate?: Rational;
   repeat: number;
 };
-export type AttachAudioDropUntilVideoOptions = {
+type AttachAudioDropUntilVideoOptions = {
   videoElement: ElementBase;
 };
-export type ElementBase = {
+type AttachBufferGapMonitorOptions = {
+  stage: string;
+  fpsNum: number;
+  fpsDen: number;
+  pad?: "src" | "sink";
+};
+type BufferGapMonitorStats = {
+  buffers: number;
+  gaps: number;
+  lastGapPtsNs: number;
+  lastGapNs: number;
+  maxGapNs: number;
+  backwards: number;
+  early: number;
+};
+type BufferGapMonitor = {
+  stats: () => BufferGapMonitorStats;
+  detach: () => void;
+};
+type ElementBase = {
   getElementProperty: (key: string) => GStreamerPropertyResult;
   setElementProperty: (key: string, value: GStreamerPropertyValue) => void;
   addPadProbe: (padName: string, callback: (bufferData: BufferData) => void) => () => void;
@@ -145,18 +164,19 @@ export type ElementBase = {
   attachSubFrameOverlay: (options: AttachSubFrameOverlayOptions) => () => void;
   attachSourceRateTimecode: (options: AttachSourceRateTimecodeOptions) => () => void;
   attachAudioDropUntilVideo: (options: AttachAudioDropUntilVideoOptions) => () => void;
+  attachBufferGapMonitor: (options: AttachBufferGapMonitorOptions) => BufferGapMonitor;
   setPad: (attribute: string, padName: string) => void;
   getPad: (padName: string) => GstPad | null;
 };
 type Element = {
   readonly type: "element";
 } & ElementBase;
-export type AppSinkElement = {
+type AppSinkElement = {
   readonly type: "app-sink-element";
   getSample(timeoutMs?: number): Promise<GStreamerSample | null>;
   onSample(callback: (sample: GStreamerSample) => void): () => void;
 } & ElementBase;
-export type AppSrcElement = {
+type AppSrcElement = {
   readonly type: "app-src-element";
   push(buffer: Buffer, pts?: Buffer | number): void;
   endOfStream(): void;
@@ -181,7 +201,7 @@ interface PipelineConstructor {
 /**
  * https://gstreamer.freedesktop.org/documentation/gstreamer/gstbuffer.html?gi-language=c#GstBufferFlags
  * */
-export declare const GstBufferFlags: {
+declare const GstBufferFlags: {
   readonly GST_BUFFER_FLAG_LIVE: 16;
   readonly GST_BUFFER_FLAG_DECODE_ONLY: 32;
   readonly GST_BUFFER_FLAG_DISCONT: 64;
@@ -199,10 +219,6 @@ export declare const GstBufferFlags: {
 };
 declare const PipelineClass: PipelineConstructor;
 declare const _default: {
-  Pipeline: PipelineConstructor;
-  GStreamerPropertyValue: GStreamerPropertyValue;
-  GStreamerSample: GStreamerSample;
-  GStreamerPropertyReturnValue: GStreamerPropertyReturnValue;
   GstBufferFlags: {
     readonly GST_BUFFER_FLAG_LIVE: 16;
     readonly GST_BUFFER_FLAG_DECODE_ONLY: 32;
@@ -219,6 +235,10 @@ declare const _default: {
     readonly GST_BUFFER_FLAG_NON_DROPPABLE: 65536;
     readonly GST_BUFFER_FLAG_LAST: 1048576;
   };
+  Pipeline: PipelineConstructor;
+  GStreamerPropertyValue: GStreamerPropertyValue;
+  GStreamerSample: GStreamerSample;
+  GStreamerPropertyReturnValue: GStreamerPropertyReturnValue;
 };
 //#endregion
-export { PipelineClass as Pipeline, _default as default };
+export { AppSinkElement, AppSrcElement, AttachAudioDropUntilVideoOptions, AttachBufferGapMonitorOptions, AttachSourceRateTimecodeOptions, AttachSubFrameOverlayOptions, BufferData, BufferGapMonitor, BufferGapMonitorStats, ElementBase, FirstFrameClockSample, FirstFrameTimecodeResult, GStreamerPropertyPrimitiveValue, GStreamerPropertyResult, GStreamerPropertyReturnValue, GStreamerPropertyValue, GStreamerSample, GstBufferFlags, GstMessage, GstPad, PipelineClass as Pipeline, RTPData, Rational, SampleFirstFrameClockOptions, SetFirstFrameTimecodeOptions, StateChangeResult, TimecodeValue, _default as default };

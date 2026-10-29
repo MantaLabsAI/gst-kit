@@ -44,6 +44,7 @@ public:
   // other events always pass. Returns a detach function that removes both probes.
   // Called on the audio element; the video element rides in `options.videoElement`.
   Napi::Value attach_audio_drop_until_video(const Napi::CallbackInfo &info);
+  Napi::Value attach_buffer_gap_monitor(const Napi::CallbackInfo &info);
   // Unwrap an optional { baseTimeElement } JS Element to a borrowed GstElement*,
   // or nullptr when absent/invalid. Static member so it may read the wrapped
   // Element's private handle. The caller takes an owning ref.

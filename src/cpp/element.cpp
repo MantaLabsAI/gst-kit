@@ -96,6 +96,13 @@ Element::Element(const Napi::CallbackInfo &info) :
     },
     "attachAudioDropUntilVideo"
   );
+  auto attach_buffer_gap_monitor_method = Napi::Function::New(
+    env,
+    [this](const Napi::CallbackInfo &info) -> Napi::Value {
+      return this->attach_buffer_gap_monitor(info);
+    },
+    "attachBufferGapMonitor"
+  );
   auto set_pad_method = Napi::Function::New(
     env, [this](const Napi::CallbackInfo &info) -> Napi::Value { return this->set_pad(info); },
     "setPad"
@@ -136,6 +143,9 @@ Element::Element(const Napi::CallbackInfo &info) :
     ),
     Napi::PropertyDescriptor::Value(
       "attachAudioDropUntilVideo", attach_audio_drop_until_video_method, napi_enumerable
+    ),
+    Napi::PropertyDescriptor::Value(
+      "attachBufferGapMonitor", attach_buffer_gap_monitor_method, napi_enumerable
     ),
     Napi::PropertyDescriptor::Value("setPad", set_pad_method, napi_enumerable),
     Napi::PropertyDescriptor::Value("getPad", get_pad_method, napi_enumerable)
@@ -1658,6 +1668,185 @@ Napi::Value Element::attach_audio_drop_until_video(const Napi::CallbackInfo &inf
       }
       return info.Env().Undefined();
     });
+}
+
+// ---------------------------------------------------------------------------
+// Buffer gap monitor (frame-skip debugging)
+//
+// Persistent buffer probe, pure C++ on the streaming thread (no
+// ThreadSafeFunction, no JS hop, no blocking). Compares each buffer's PTS to the
+// previous buffer's PTS at this pad and logs ONE g_message line only when the
+// step is anomalous. The context is shared (shared_ptr) between the probe and the
+// returned stats() closure, so stats() stays valid after detach/pad teardown.
+// ---------------------------------------------------------------------------
+struct BufferGapMonitorContext {
+  std::string stage;
+  guint64 frame_duration_ns = 0;
+  // Streaming-thread-only state (single writer).
+  guint64 prev_pts = GST_CLOCK_TIME_NONE;
+  // Stats, read from the JS thread.
+  std::atomic<guint64> buffers{0};
+  std::atomic<guint64> gaps{0};
+  std::atomic<guint64> backwards{0};
+  std::atomic<guint64> early{0};
+  std::atomic<guint64> last_gap_pts_ns{0};
+  std::atomic<guint64> last_gap_ns{0};
+  std::atomic<guint64> max_gap_ns{0};
+};
+
+static GstPadProbeReturn
+buffer_gap_monitor_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data) {
+  (void)pad;
+  BufferGapMonitorContext *ctx =
+    static_cast<std::shared_ptr<BufferGapMonitorContext> *>(user_data)->get();
+  if (!(GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER))
+    return GST_PAD_PROBE_OK;
+  GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+  if (!buffer)
+    return GST_PAD_PROBE_OK;
+
+  const guint64 n = ctx->buffers.fetch_add(1, std::memory_order_relaxed);
+  const GstClockTime pts = GST_BUFFER_PTS(buffer);
+
+  if (n == 0) {
+    g_message("buffer.first stage=%s pts_ns=%s mono_us=%" G_GINT64_FORMAT,
+              ctx->stage.c_str(),
+              GST_CLOCK_TIME_IS_VALID(pts) ? std::to_string(pts).c_str() : "none",
+              g_get_monotonic_time());
+  }
+
+  if (!GST_CLOCK_TIME_IS_VALID(pts))
+    return GST_PAD_PROBE_OK; // no PTS: skip delta, keep prev
+
+  const guint64 prev = ctx->prev_pts;
+  ctx->prev_pts = pts;
+  if (!GST_CLOCK_TIME_IS_VALID(prev))
+    return GST_PAD_PROBE_OK; // first PTS seen: nothing to compare
+
+  const gint64 delta = (gint64)pts - (gint64)prev;
+  const double fd = (double)ctx->frame_duration_ns;
+  const char *kind = NULL;
+  if (delta <= 0) {
+    kind = "backwards";
+    ctx->backwards.fetch_add(1, std::memory_order_relaxed);
+  } else if ((double)delta > 1.5 * fd) {
+    kind = "gap";
+    ctx->gaps.fetch_add(1, std::memory_order_relaxed);
+    ctx->last_gap_pts_ns.store(pts, std::memory_order_relaxed);
+    ctx->last_gap_ns.store((guint64)delta, std::memory_order_relaxed);
+    if ((guint64)delta > ctx->max_gap_ns.load(std::memory_order_relaxed))
+      ctx->max_gap_ns.store((guint64)delta, std::memory_order_relaxed);
+  } else if ((double)delta < 0.5 * fd) {
+    kind = "early";
+    ctx->early.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (!kind)
+    return GST_PAD_PROBE_OK;
+
+  const GstClockTime dts = GST_BUFFER_DTS(buffer);
+  const guint64 offset = GST_BUFFER_OFFSET(buffer);
+  g_message("buffer.gap stage=%s kind=%s n=%" G_GUINT64_FORMAT " prev_pts_ns=%" G_GUINT64_FORMAT
+            " pts_ns=%" G_GUINT64_FORMAT " delta_ns=%" G_GINT64_FORMAT
+            " x_step=%.2f mono_us=%" G_GINT64_FORMAT " buf_offset=%" G_GINT64_FORMAT
+            " flags=0x%x dts_ns=%s",
+            ctx->stage.c_str(), kind, n, prev, (guint64)pts, delta, (double)delta / fd,
+            g_get_monotonic_time(),
+            GST_BUFFER_OFFSET_IS_VALID(buffer) ? (gint64)offset : (gint64)-1,
+            (guint)GST_BUFFER_FLAGS(buffer),
+            GST_CLOCK_TIME_IS_VALID(dts) ? std::to_string(dts).c_str() : "none");
+  return GST_PAD_PROBE_OK;
+}
+
+Napi::Value Element::attach_buffer_gap_monitor(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  if (!element.get()) {
+    Napi::TypeError::New(env, "Element is null or not initialized")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  if (info.Length() < 1 || !info[0].IsObject()) {
+    Napi::TypeError::New(env, "attachBufferGapMonitor requires an options object")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object opts = info[0].As<Napi::Object>();
+  if (!opts.Has("stage") || !opts.Get("stage").IsString()) {
+    Napi::TypeError::New(env, "attachBufferGapMonitor: options.stage (string) required")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  auto unum = [&](const char *k) -> double {
+    return (opts.Has(k) && opts.Get(k).IsNumber()) ? opts.Get(k).As<Napi::Number>().DoubleValue()
+                                                   : 0;
+  };
+  const double fps_num = unum("fpsNum");
+  const double fps_den = unum("fpsDen");
+  if (!(fps_num > 0) || !(fps_den > 0)) {
+    Napi::TypeError::New(env, "attachBufferGapMonitor: options.fpsNum and options.fpsDen must be > 0")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  std::string pad_name = "src";
+  if (opts.Has("pad") && opts.Get("pad").IsString())
+    pad_name = opts.Get("pad").As<Napi::String>().Utf8Value();
+  if (pad_name != "src" && pad_name != "sink") {
+    Napi::TypeError::New(env, "attachBufferGapMonitor: options.pad must be 'src' or 'sink'")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  GstPad *pad = gst_element_get_static_pad(element.get(), pad_name.c_str());
+  if (!pad) {
+    Napi::Error::New(env, "attachBufferGapMonitor: element has no '" + pad_name + "' pad")
+      .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+
+  auto ctx = std::make_shared<BufferGapMonitorContext>();
+  ctx->stage = opts.Get("stage").As<Napi::String>().Utf8Value();
+  ctx->frame_duration_ns = (guint64)(fps_den * 1e9 / fps_num);
+  if (ctx->frame_duration_ns == 0) ctx->frame_duration_ns = 1;
+
+  auto *probe_ctx = new std::shared_ptr<BufferGapMonitorContext>(ctx);
+  gulong probe_id = gst_pad_add_probe(
+    pad, GST_PAD_PROBE_TYPE_BUFFER, buffer_gap_monitor_probe, probe_ctx,
+    [](gpointer data) { delete static_cast<std::shared_ptr<BufferGapMonitorContext> *>(data); });
+
+  auto *pad_ref = static_cast<GstPad *>(gst_object_ref(pad));
+  gst_object_unref(pad);
+  auto detached = std::make_shared<bool>(false);
+
+  Napi::Object result = Napi::Object::New(env);
+  result.Set(
+    "stats",
+    Napi::Function::New(env, [ctx](const Napi::CallbackInfo &cb) -> Napi::Value {
+      Napi::Env e = cb.Env();
+      Napi::Object o = Napi::Object::New(e);
+      auto num = [](const std::atomic<guint64> &v) {
+        return (double)v.load(std::memory_order_relaxed);
+      };
+      o.Set("buffers", num(ctx->buffers));
+      o.Set("gaps", num(ctx->gaps));
+      o.Set("lastGapPtsNs", num(ctx->last_gap_pts_ns));
+      o.Set("lastGapNs", num(ctx->last_gap_ns));
+      o.Set("maxGapNs", num(ctx->max_gap_ns));
+      o.Set("backwards", num(ctx->backwards));
+      o.Set("early", num(ctx->early));
+      return o;
+    })
+  );
+  result.Set(
+    "detach",
+    Napi::Function::New(env, [pad_ref, probe_id, detached](const Napi::CallbackInfo &cb) -> Napi::Value {
+      if (!*detached) {
+        *detached = true;
+        gst_pad_remove_probe(pad_ref, probe_id);
+        gst_object_unref(pad_ref);
+      }
+      return cb.Env().Undefined();
+    })
+  );
+  return result;
 }
 
 Napi::Value Element::push(const Napi::CallbackInfo &info) {
